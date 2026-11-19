@@ -24,7 +24,6 @@ const PATIENT_TOOLS: ChatCompletionTool[] = [
 export async function runPatientAgent(payload: { from: string; content: string }): Promise<void> {
   const { from, content: text } = payload;
   try {
-    // 1. Crear o recuperar paciente usando explícitamente supabaseAdmin
     let { data: patient } = await supabaseAdmin.from('patients').select('*').eq('phone', from).maybeSingle();
     if (!patient) {
       const { data: created } = await supabaseAdmin.from('patients').insert({ phone: from, chat_mode: 'AI_ACTIVE' }).select('*').single();
@@ -41,10 +40,15 @@ export async function runPatientAgent(payload: { from: string; content: string }
 Fecha: ${new Date().toLocaleString('es-MX', { timeZone: TIMEZONE })}.
 Paciente actual: ${patient?.full_name || 'Pendiente'}.
 
-REGLAS:
-1. Si Paciente es "Pendiente" y saluda, DEBES presentarte y preguntarle cómo se llama.
-2. Al recibir el nombre, usa 'save_patient_onboarding' y luego INMEDIATAMENTE ejecuta 'show_interactive_menu' para darle opciones.
-3. No escribas listas; siempre usa 'show_interactive_menu'.`;
+INSTRUCCIONES CLAVE (SÍGUELAS AL PIE DE LA LETRA):
+1. ONBOARDING: Si el Paciente actual es "Pendiente", preséntate y pregúntale cómo se llama. No uses menús todavía.
+2. MOSTRAR MENÚ: Una vez que el paciente te diga su nombre, usa 'save_patient_onboarding' y luego usa 'show_interactive_menu' UNA SOLA VEZ para darle las opciones.
+3. ACCIONES SEGÚN EL MENÚ: Cuando el paciente seleccione una opción, DEBES ACTUAR usando la herramienta correspondiente (NO vuelvas a mostrar el menú):
+   - "Agendar cita" o "Cita urgente": Pregúntale brevemente el motivo y su edad, y luego usa 'check_calendar_availability'.
+   - "Tratamientos/Precios" o "Info y Políticas": Usa 'consult_clinic_info' para buscar la respuesta.
+   - "Cancelar/Reagendar": Usa 'get_my_appointments' para ver sus citas futuras y ayudarle.
+   - "Hablar con el doctor": Usa 'escalate_to_doctor'.
+4. NUNCA respondas repitiendo 'show_interactive_menu' de forma consecutiva. Responde conversacionalmente y ejecuta herramientas.`;
 
     const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }, ...history];
     if (history.length === 0 || history[history.length - 1].content !== text) messages.push({ role: 'user', content: text });
