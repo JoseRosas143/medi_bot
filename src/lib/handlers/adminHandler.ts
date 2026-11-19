@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { supabaseAdmin as supabase } from '@/lib/supabase';
-import { sendWhatsAppText, sendWhatsAppInteractiveButtons } from '@/lib/whatsapp';
+import { sendWhatsAppText } from '@/lib/whatsapp';
 import { getAppointmentsByDateRange, cancelCalendarEvent } from '@/lib/calendar';
 import { generateEmbedding } from '@/lib/knowledge';
 import type { IncomingMessage } from '@/lib/message-handlers';
@@ -79,6 +79,8 @@ export async function runAdminAgent(payload: IncomingMessage): Promise<void> {
       }
 
       for (const toolCall of assistantMessage.tool_calls) {
+        if (toolCall.type !== 'function') continue; // <-- Corrección TypeScript
+
         const name = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments || '{}');
         let output = '';
@@ -92,7 +94,6 @@ export async function runAdminAgent(payload: IncomingMessage): Promise<void> {
           await sendWhatsAppText(args.phone, args.message);
           output = JSON.stringify({ success: true, message: 'Mensaje enviado al paciente.' });
         }
-        // ... (El resto de las funciones de calendar se mantienen como estaban)
         else {
           output = JSON.stringify({ success: true });
         }
@@ -104,4 +105,4 @@ export async function runAdminAgent(payload: IncomingMessage): Promise<void> {
   } catch (error) {
     console.error(error);
   }
-}   
+}

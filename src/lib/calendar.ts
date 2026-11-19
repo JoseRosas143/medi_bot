@@ -13,22 +13,19 @@ export async function getAvailableSlots(dateStr: string, durationMinutes = 45) {
   });
   const calendar = google.calendar({ version: 'v3', auth });
 
-  const startOfDay = new Date(`${dateStr}T09:00:00-06:00`); // Ajusta la hora de inicio de la clínica
-  const endOfDay = new Date(`${dateStr}T19:00:00-06:00`); // Ajusta la hora de cierre de la clínica
+  const startOfDay = new Date(`${dateStr}T09:00:00-06:00`); 
+  const endOfDay = new Date(`${dateStr}T19:00:00-06:00`); 
 
   const response = await calendar.freebusy.query({
     requestBody: {
       timeMin: startOfDay.toISOString(),
       timeMax: endOfDay.toISOString(),
       timeZone: TIMEZONE,
-      items: [{ id: process.env.GOOGLE_CALENDAR_ID }],
+      items: [{ id: process.env.GOOGLE_CALENDAR_ID as string }],
     },
   });
 
   const busySlots = response.data.calendars?.[process.env.GOOGLE_CALENDAR_ID as string]?.busy || [];
-  
-  // Aquí podrías agregar la lógica para calcular los huecos libres exactos restando los busySlots.
-  // Para simplificar, devolvemos los ocupados para que la IA sepa qué NO ofrecer.
   return { date: dateStr, busySlots };
 }
 
@@ -55,7 +52,7 @@ export async function createCalendarAppointment(params: {
   const description = `Teléfono: ${params.patientPhone}\nMotivo: ${params.reason || 'No especificado'}\nResumen: ${params.clinicalSummary || 'N/A'}`;
 
   const event = await calendar.events.insert({
-    calendarId: process.env.GOOGLE_CALENDAR_ID,
+    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
     requestBody: {
       summary: title,
       description,
@@ -82,14 +79,14 @@ export async function getAppointmentsByDateRange(startIso: string, endIso: strin
   const calendar = google.calendar({ version: 'v3', auth });
 
   const response = await calendar.events.list({
-    calendarId: process.env.GOOGLE_CALENDAR_ID,
+    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
     timeMin: startIso,
     timeMax: endIso,
     singleEvents: true,
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map(event => ({
+  return (response.data.items || []).map((event: any) => ({
     eventId: event.id,
     summary: event.summary,
     start: event.start?.dateTime || event.start?.date,
@@ -98,7 +95,7 @@ export async function getAppointmentsByDateRange(startIso: string, endIso: strin
   }));
 }
 
-// 4. OBTENER CITAS DE UN PACIENTE ESPECÍFICO (Para el Paciente - ¡La que faltaba!)
+// 4. OBTENER CITAS DE UN PACIENTE ESPECÍFICO (Para el Paciente)
 export async function getPatientAppointments(patientPhone: string) {
   const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -109,17 +106,17 @@ export async function getPatientAppointments(patientPhone: string) {
   });
   const calendar = google.calendar({ version: 'v3', auth });
   
-  const timeMin = new Date().toISOString(); // Desde ahora en adelante
+  const timeMin = new Date().toISOString(); 
   
   const response = await calendar.events.list({
-    calendarId: process.env.GOOGLE_CALENDAR_ID,
+    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
     timeMin,
-    privateExtendedProperty: `patientPhone=${patientPhone}`, // Filtra por su teléfono
+    privateExtendedProperty: [`patientPhone=${patientPhone}`],
     singleEvents: true,
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map(event => ({
+  return (response.data.items || []).map((event: any) => ({
     eventId: event.id,
     summary: event.summary,
     start: event.start?.dateTime || event.start?.date,
@@ -138,12 +135,11 @@ export async function cancelCalendarEvent(eventId: string) {
   });
   const calendar = google.calendar({ version: 'v3', auth });
 
-  // 1. Obtener detalles antes de borrar para notificar
   let patientName = '';
   let patientPhone = '';
   try {
     const event = await calendar.events.get({
-      calendarId: process.env.GOOGLE_CALENDAR_ID,
+      calendarId: process.env.GOOGLE_CALENDAR_ID as string,
       eventId,
     });
     patientName = event.data.summary?.replace('[URGENTE] Cita: ', '')?.replace('Cita: ', '') || '';
@@ -152,9 +148,8 @@ export async function cancelCalendarEvent(eventId: string) {
     console.warn('No se pudo recuperar información del evento antes de borrarlo.', error);
   }
 
-  // 2. Borrar
   await calendar.events.delete({
-    calendarId: process.env.GOOGLE_CALENDAR_ID,
+    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
     eventId,
   });
 

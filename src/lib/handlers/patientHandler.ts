@@ -15,11 +15,11 @@ const PATIENT_TOOLS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'show_interactive_menu',
-      description: 'Envía el menú principal interactivo de WhatsApp al paciente. Úsalo inmediatamente después de que el paciente te diga su nombre, o si pide ver las opciones.',
+      description: 'Envía el menú principal interactivo de WhatsApp al paciente. Úsalo inmediatamente después de que el paciente te diga su nombre.',
       parameters: {
         type: 'object',
         properties: {
-          greeting_text: { type: 'string', description: 'Texto que acompañará al menú. Ej: "Hola José, estas son las cosas con las que te puedo ayudar:"' }
+          greeting_text: { type: 'string', description: 'Texto que acompañará al menú. Ej: "Hola José, estas son las opciones:"' }
         },
         required: ['greeting_text'],
       },
@@ -29,12 +29,12 @@ const PATIENT_TOOLS: ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'send_confirmation_buttons',
-      description: 'Envía una pregunta con botones de respuesta rápida (ej. Sí / No) para confirmar una reserva o cancelación.',
+      description: 'Envía una pregunta con botones de respuesta rápida (ej. Sí / No).',
       parameters: {
         type: 'object',
         properties: {
-          message: { type: 'string', description: 'Pregunta de confirmación.' },
-          buttons: { type: 'array', items: { type: 'string' }, description: 'Máximo 3 opciones breves.' }
+          message: { type: 'string' },
+          buttons: { type: 'array', items: { type: 'string' } }
         },
         required: ['message', 'buttons'],
       },
@@ -154,11 +154,11 @@ Fecha actual: ${new Intl.DateTimeFormat('es-MX', { timeZone: TIMEZONE, dateStyle
 Estado del paciente: Nombre: ${patient.full_name || 'Pendiente'}.
 
 REGLAS DE INTERACCIÓN (SÍGUELAS ESTRICTAMENTE):
-1. **Onboarding:** Si el Nombre es "Pendiente" y el usuario dice Hola, salúdalo con "Hola, soy ${botName} tu asistente de la clínica ${clinicName}, ¿cómo te llamas?". 
-2. **Despliegue de Menú:** Cuando el usuario diga su nombre, usa \`save_patient_onboarding\` e INMEDIATAMENTE usa \`show_interactive_menu\` enviándole un texto como "Hola [Nombre], estas son las cosas con las que te puedo ayudar:".
-3. **Botones de Confirmación:** Si estás por agendar o cancelar una cita, usa \`send_confirmation_buttons\` (ej. "¿Confirmo tu cita el Martes a las 4pm?" con botones "Sí, confirmar" y "Cancelar").
-4. **Agendar:** Pide edad y motivo, usa \`check_calendar_availability\`, muestra opciones y usa \`book_calendar_appointment\`. Si eligió "Agendar cita de urgencia", márcala como is_urgent=true.
-5. **Cancelar/Reagendar:** Usa \`get_my_appointments\` para ver sus citas futuras, pregúntale cuál quiere modificar, y usa \`cancel_my_appointment\`.
+1. **Onboarding:** Si el Nombre es "Pendiente" y el usuario dice Hola, salúdalo preguntando cómo se llama.
+2. **Despliegue de Menú:** Cuando el usuario diga su nombre, usa \`save_patient_onboarding\` e INMEDIATAMENTE usa \`show_interactive_menu\`.
+3. **Botones de Confirmación:** Usa \`send_confirmation_buttons\` para confirmar citas o cancelaciones.
+4. **Agendar:** Pide edad y motivo, revisa horarios, y usa \`book_calendar_appointment\`. Si es urgencia, marca is_urgent=true.
+5. **Cancelar/Reagendar:** Usa \`get_my_appointments\` para buscar sus citas futuras y \`cancel_my_appointment\` para borrarla.
 6. **Hablar con el doctor:** Ejecuta \`escalate_to_doctor\`.`;
 
     const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }, ...history];
@@ -184,6 +184,8 @@ REGLAS DE INTERACCIÓN (SÍGUELAS ESTRICTAMENTE):
       }
 
       for (const toolCall of assistantMessage.tool_calls) {
+        if (toolCall.type !== 'function') continue; // <-- Esto corrige el error de TypeScript
+        
         const name = toolCall.function.name;
         const args = JSON.parse(toolCall.function.arguments || '{}');
         let output = '';
@@ -194,39 +196,18 @@ REGLAS DE INTERACCIÓN (SÍGUELAS ESTRICTAMENTE):
             bodyText: args.greeting_text,
             buttonText: 'Ver opciones',
             sections: [
-              {
-                title: 'Consultas',
-                rows: [
-                  { id: 'agendar', title: 'Agendar cita' },
-                  { id: 'urgencia', title: 'Agendar cita de urgencia' },
-                  { id: 'cancelar', title: 'Cancelar mi cita' }
-                ]
-              },
-              {
-                title: 'Información',
-                rows: [
-                  { id: 'precios', title: 'Tratamientos y precios' },
-                  { id: 'tratamiento', title: 'Explicar mi tratamiento' },
-                  { id: 'faqs', title: 'FAQS' }
-                ]
-              },
-              {
-                title: 'Atención Personal',
-                rows: [ { id: 'doctor', title: 'Hablar con el doctor' } ]
-              }
+              { title: 'Consultas', rows: [{ id: 'agendar', title: 'Agendar cita' }, { id: 'urgencia', title: 'Cita de urgencia' }, { id: 'cancelar', title: 'Cancelar mi cita' }] },
+              { title: 'Información', rows: [{ id: 'precios', title: 'Tratamientos/precios' }, { id: 'tratamiento', title: 'Mi tratamiento' }, { id: 'faqs', title: 'FAQS' }] },
+              { title: 'Atención Personal', rows: [ { id: 'doctor', title: 'Hablar con el doctor' } ] }
             ]
           });
           hasSentInteractiveUI = true;
-          output = JSON.stringify({ success: true, message: 'Menú enviado. Espera la selección del usuario.' });
+          output = JSON.stringify({ success: true, message: 'Menú enviado.' });
         }
         else if (name === 'send_confirmation_buttons') {
-          await sendWhatsAppInteractiveButtons({
-            to: from,
-            bodyText: args.message,
-            buttons: args.buttons
-          });
+          await sendWhatsAppInteractiveButtons({ to: from, bodyText: args.message, buttons: args.buttons });
           hasSentInteractiveUI = true;
-          output = JSON.stringify({ success: true, message: 'Botones enviados. Espera la selección del usuario.' });
+          output = JSON.stringify({ success: true, message: 'Botones enviados.' });
         }
         else if (name === 'consult_clinic_info') {
           const matches = await searchKnowledge(args.query, 4, 0.45);
@@ -234,11 +215,9 @@ REGLAS DE INTERACCIÓN (SÍGUELAS ESTRICTAMENTE):
         }
         else if (name === 'save_patient_onboarding') {
           await supabase.from('patients').update({
-            full_name: args.full_name || patient.full_name,
-            age: args.age || patient.age,
-            allergies_or_meds: args.allergies_or_meds || patient.allergies_or_meds
+            full_name: args.full_name || patient.full_name, age: args.age || patient.age, allergies_or_meds: args.allergies_or_meds || patient.allergies_or_meds
           }).eq('phone', from);
-          patient.full_name = args.full_name || patient.full_name; // Actualizar memoria local
+          patient.full_name = args.full_name || patient.full_name; 
           output = JSON.stringify({ success: true });
         }
         else if (name === 'check_calendar_availability') {
@@ -246,15 +225,7 @@ REGLAS DE INTERACCIÓN (SÍGUELAS ESTRICTAMENTE):
         }
         else if (name === 'book_calendar_appointment') {
           try {
-            const result = await createCalendarAppointment({
-              patientName: patient.full_name || 'Paciente',
-              patientPhone: from,
-              startTime: args.start_time,
-              endTime: args.end_time,
-              reason: args.reason,
-              clinicalSummary: `Edad: ${patient.age || 'N/A'}. Alergias: ${patient.allergies_or_meds || 'N/A'}`,
-              isUrgent: args.is_urgent
-            });
+            const result = await createCalendarAppointment({ patientName: patient.full_name || 'Paciente', patientPhone: from, startTime: args.start_time, endTime: args.end_time, reason: args.reason, clinicalSummary: `Edad: ${patient.age || 'N/A'}. Alergias: ${patient.allergies_or_meds || 'N/A'}`, isUrgent: args.is_urgent });
             output = JSON.stringify(result);
           } catch (err) { output = JSON.stringify({ error: String(err) }); }
         }
