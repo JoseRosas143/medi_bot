@@ -13,7 +13,6 @@ export async function GET(request: Request) {
 
   try {
     const now = new Date();
-    // Buscar citas para las próximas 24 horas (margen de 23 a 25 horas)
     const startIso = new Date(now.getTime() + 23 * 60 * 60 * 1000).toISOString();
     const endIso = new Date(now.getTime() + 25 * 60 * 60 * 1000).toISOString();
 
@@ -21,15 +20,12 @@ export async function GET(request: Request) {
     let sent = 0;
 
     for (const appt of appointments) {
-      const patientPhone = appt.patientPhone;
-      if (!patientPhone) continue;
+      if (!appt.patientPhone) continue;
 
-      // Extraer el nombre del summary (ej. "Cita: José" -> "José")
-      const patientName = appt.summary?.replace(/\[URGENTE\]\s*Cita:\s*/i, '')?.replace(/Cita:\s*/i, '') || 'Paciente';
-      
-      // Formatear la fecha para que Meta la envíe amigable
-      const dateObj = new Date(appt.start as string);
-      const formattedTime = new Intl.DateTimeFormat('es-MX', {
+      // Variables locales procesadas a partir de la interfaz de CalendarEventData
+      const localPatientName = appt.summary.replace(/\[URGENTE\]\s*Cita:\s*/i, '').replace(/Cita:\s*/i, '') || 'Paciente';
+      const dateObj = new Date(appt.start);
+      const localFormattedTime = new Intl.DateTimeFormat('es-MX', {
         timeZone: process.env.CLINIC_TIMEZONE || 'America/Mexico_City',
         weekday: 'long',
         hour: 'numeric',
@@ -39,25 +35,25 @@ export async function GET(request: Request) {
 
       try {
         await sendWhatsAppTemplate(
-          patientPhone,
+          appt.patientPhone,
           'cita_recordatorio',
-          [patientName, 'nuestra clínica', formattedTime]
+          [localPatientName, 'nuestra clínica', localFormattedTime]
         );
         
         await supabaseAdmin.from('chat_messages').insert({
-          patient_phone: patientPhone,
+          patient_phone: appt.patientPhone,
           role: 'assistant',
-          content: `⏰ (Sistema) Recordatorio enviado automáticamente para la cita del ${formattedTime}.`
+          content: `⏰ Recordatorio automático enviado para la cita del ${localFormattedTime}.`
         });
         sent++;
       } catch (err) {
-        console.warn(`[Cron] No se pudo enviar recordatorio a ${patientPhone}:`, err);
+        console.warn(`[Cron] Falló recordatorio para ${appt.patientPhone}:`, err);
       }
     }
 
     return NextResponse.json({ success: true, reminders_sent: sent });
   } catch (error) {
-    console.error('[Cron] Error interno:', error);
+    console.error('[Cron Error]:', error);
     return NextResponse.json({ success: false, error: String(error) }, { status: 500 });
   }
 }

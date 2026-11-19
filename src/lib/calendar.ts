@@ -2,6 +2,15 @@ import { google } from 'googleapis';
 
 const TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
 
+// Interfaces estrictas para evitar errores de compilación en Vercel
+export interface CalendarEventData {
+  eventId: string;
+  summary: string;
+  start: string;
+  end: string;
+  patientPhone: string;
+}
+
 function getCalendarClient() {
   const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -17,7 +26,7 @@ export async function getAvailableSlots(dateStr: string, durationMinutes = 45) {
   const calendar = getCalendarClient();
   const startOfDay = new Date(`${dateStr}T09:00:00-06:00`); 
   const endOfDay = new Date(`${dateStr}T19:00:00-06:00`); 
-  const calendarId = process.env.GOOGLE_CALENDAR_ID as string;
+  const calendarId = String(process.env.GOOGLE_CALENDAR_ID);
 
   const response = await calendar.freebusy.query({
     requestBody: {
@@ -46,7 +55,7 @@ export async function createCalendarAppointment(params: {
   const description = `Teléfono: ${params.patientPhone}\nMotivo: ${params.reason || 'No especificado'}\nResumen: ${params.clinicalSummary || 'N/A'}`;
 
   const event = await calendar.events.insert({
-    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
+    calendarId: String(process.env.GOOGLE_CALENDAR_ID),
     requestBody: {
       summary: title,
       description,
@@ -59,42 +68,45 @@ export async function createCalendarAppointment(params: {
   return { success: true, eventId: event.data.id, message: 'Cita agendada correctamente.' };
 }
 
-export async function getAppointmentsByDateRange(startIso: string, endIso: string) {
+export async function getAppointmentsByDateRange(startIso: string, endIso: string): Promise<CalendarEventData[]> {
   const calendar = getCalendarClient();
   const response = await calendar.events.list({
-    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
+    calendarId: String(process.env.GOOGLE_CALENDAR_ID),
     timeMin: startIso,
     timeMax: endIso,
     singleEvents: true,
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map((event) => ({
-    eventId: event.id,
-    summary: event.summary,
-    start: event.start?.dateTime || event.start?.date,
-    end: event.end?.dateTime || event.end?.date,
-    patientPhone: event.extendedProperties?.private?.patientPhone,
+  const items = response.data.items || [];
+  return items.map((event) => ({
+    eventId: String(event.id),
+    summary: String(event.summary || 'Cita'),
+    start: String(event.start?.dateTime || event.start?.date),
+    end: String(event.end?.dateTime || event.end?.date),
+    patientPhone: String(event.extendedProperties?.private?.patientPhone || ''),
   }));
 }
 
-export async function getPatientAppointments(patientPhone: string) {
+export async function getPatientAppointments(patientPhone: string): Promise<CalendarEventData[]> {
   const calendar = getCalendarClient();
   const timeMin = new Date().toISOString(); 
   
   const response = await calendar.events.list({
-    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
+    calendarId: String(process.env.GOOGLE_CALENDAR_ID),
     timeMin,
     privateExtendedProperty: [`patientPhone=${patientPhone}`],
     singleEvents: true,
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map((event) => ({
-    eventId: event.id,
-    summary: event.summary,
-    start: event.start?.dateTime || event.start?.date,
-    end: event.end?.dateTime || event.end?.date,
+  const items = response.data.items || [];
+  return items.map((event) => ({
+    eventId: String(event.id),
+    summary: String(event.summary || 'Cita'),
+    start: String(event.start?.dateTime || event.start?.date),
+    end: String(event.end?.dateTime || event.end?.date),
+    patientPhone: String(event.extendedProperties?.private?.patientPhone || ''),
   }));
 }
 
@@ -105,17 +117,17 @@ export async function cancelCalendarEvent(eventId: string) {
   
   try {
     const event = await calendar.events.get({
-      calendarId: process.env.GOOGLE_CALENDAR_ID as string,
+      calendarId: String(process.env.GOOGLE_CALENDAR_ID),
       eventId,
     });
-    patientName = event.data.summary?.replace(/\[URGENTE\]\s*Cita:\s*/i, '')?.replace(/Cita:\s*/i, '') || '';
-    patientPhone = event.data.extendedProperties?.private?.patientPhone || '';
+    patientName = String(event.data.summary || '').replace(/\[URGENTE\]\s*Cita:\s*/i, '').replace(/Cita:\s*/i, '');
+    patientPhone = String(event.data.extendedProperties?.private?.patientPhone || '');
   } catch (error) {
-    console.warn('Advertencia: No se pudo obtener datos previos del evento.', error);
+    console.warn('No se pudieron obtener datos del evento previo a borrarlo.', error);
   }
 
   await calendar.events.delete({
-    calendarId: process.env.GOOGLE_CALENDAR_ID as string,
+    calendarId: String(process.env.GOOGLE_CALENDAR_ID),
     eventId,
   });
 
