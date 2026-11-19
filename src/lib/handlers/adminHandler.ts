@@ -1,105 +1,142 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
-import { supabaseAdmin as supabase } from '@/lib/supabase';
-import { sendWhatsAppText, sendWhatsAppInteractiveList } from '@/lib/whatsapp';
-import { getAppointmentsByDateRange, cancelCalendarEvent } from '@/lib/calendar';
+import { supabaseAdmin as db } from '@/lib/supabase';
+import { getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
+import { clinicDate, clinicDayRange, formatAppointment } from '@/lib/clinic-time';
+import { proposeAppointmentAction } from '@/lib/appointment-actions';
+import { findCatalogEntries, normalized, showAdminMenu, type Catalog } from '@/lib/menus';
+import { sendWhatsAppText } from '@/lib/whatsapp';
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const ADMIN_MODEL = 'gpt-4o-mini';
-const TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
-export const dynamic = 'force-dynamic';
+export async function showSchedule(phone: string, date = clinicDate(), events?: CalendarEventData[]) {
+  const appointments = events ?? await getAppointmentsByDateRange(...clinicDayRange(date));
+  const lines = appointments.slice(0, 25).map(event => `• ${formatAppointment(event.start)} — ${event.summary}`);
+  await sendWhatsAppText(phone, `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}`);
+}
 
-const ADMIN_TOOLS: ChatCompletionTool[] = [
-  { type: 'function', function: { name: 'show_admin_menu', description: 'Muestra el panel interactivo de administración.', parameters: { type: 'object', properties: {} } } },
-  { type: 'function', function: { name: 'get_today_schedule', description: 'Consulta Google Calendar para buscar citas o extraer eventIds ocultos.', parameters: { type: 'object', properties: { date_str: { type: 'string' } }, required: ['date_str'] } } },
-  { type: 'function', function: { name: 'cancel_patient_appointments', description: 'Cancela citas definitivamente usando sus eventIds.', parameters: { type: 'object', properties: { event_ids: { type: 'array', items: { type: 'string' } } }, required: ['event_ids'] } } },
-  { type: 'function', function: { name: 'manage_treatments', description: 'Gestiona la tabla exacta de tratamientos.', parameters: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'update', 'delete', 'list'] }, name: { type: 'string' }, price: { type: 'number' } }, required: ['action'] } } },
-  { type: 'function', function: { name: 'manage_faqs', description: 'Gestiona la tabla exacta de FAQs.', parameters: { type: 'object', properties: { action: { type: 'string', enum: ['add', 'update', 'delete', 'list'] }, question: { type: 'string' }, answer: { type: 'string' } }, required: ['action'] } } }
+const tools: ChatCompletionTool[] = [
+  { type: 'function', function: {
+    name: 'schedule', description: 'Consulta la agenda de un día. Usa get_clinic_date del contexto para hoy.',
+    parameters: { type: 'object', properties: { date: { type: 'string', description: 'YYYY-MM-DD' } }, required: ['date'] },
+  } },
+  { type: 'function', function: {
+    name: 'find_cancellation', description: 'Busca cita futura por fecha, hora y/o paciente. Prepara un botón si hay una sola coincidencia.',
+    parameters: { type: 'object', properties: {
+      date: { type: 'string', description: 'YYYY-MM-DD' }, patient: { type: 'string' },
+      time: { type: 'string', description: 'Hora local HH:MM' },
+    }, required: ['date'] },
+  } },
+  { type: 'function', function: {
+    name: 'manage_catalog', description: 'Lista, agrega, actualiza o retira un tratamiento o FAQ. Para editar o retirar, label es el nombre o pregunta existente.',
+    parameters: { type: 'object', properties: {
+      catalog: { type: 'string', enum: ['treatments', 'faqs'] }, action: { type: 'string', enum: ['list', 'add', 'update', 'delete'] },
+      label: { type: 'string' }, new_label: { type: 'string' }, price: { type: 'number' }, answer: { type: 'string' },
+    }, required: ['catalog', 'action'] },
+  } },
+  { type: 'function', function: {
+    name: 'add_task', description: 'Anota un pendiente interno solicitado por el administrador.',
+    parameters: { type: 'object', properties: { description: { type: 'string' } }, required: ['description'] },
+  } },
 ];
 
-export async function runAdminAgent(payload: { from: string; content: string }): Promise<void> {
-  const { from, content: text } = payload;
-  try {
-    const { data: settings } = await supabase.from('bot_settings').select('*').eq('id', 1).single();
-    const fechaActual = new Date().toLocaleString('es-MX', { timeZone: TIMEZONE, dateStyle: 'full', timeStyle: 'short' });
+type CatalogRequest = { catalog: Catalog; action: string; label?: string; new_label?: string; price?: number; answer?: string };
 
-    const systemPrompt = `Eres el asistente operativo interno. Usuario actual: Administrador. Fecha: ${fechaActual}.
-REGLAS ESTRICTAS Y PERMISOS:
-1. Eres el administrador del sistema. TIENES PERMISOS TOTALES.
-2. MENÚ: Si escribe "Ayuda", "Menú" u "Opciones", ejecuta 'show_admin_menu'.
-3. TRATAMIENTOS: Si pide agregar, cambiar o borrar un Tratamiento, usa 'manage_treatments' de forma silenciosa e infórmalo.
-4. FAQS/POLÍTICAS: Si pide agregar, editar o eliminar información/FAQs, usa 'manage_faqs'.
-5. CANCELAR CITAS (CRÍTICO): Si pide cancelar una cita, haz dos pasos seguidos de forma invisible: ejecuta 'get_today_schedule' para buscar el evento, extrae su 'eventId', y ejecuta 'cancel_patient_appointments'. Eres 100% capaz de hacerlo.`;
+async function manageCatalog(args: CatalogRequest) {
+  const { catalog, action } = args;
+  if (catalog !== 'treatments' && catalog !== 'faqs') return 'Elige un catálogo válido.';
+  const treatments = catalog === 'treatments';
+  const field = treatments ? 'name' : 'question';
+  if (action === 'list') {
+    const { data } = await db.from(catalog).select('*').eq('is_active', true).order('id').limit(25).throwOnError();
+    return data ?? [];
+  }
+  const label = args.label?.trim();
+  if (!label || label.length > 250) return 'Especifica el nombre o la pregunta.';
+  const priceValid = typeof args.price === 'number' && Number.isFinite(args.price) && args.price >= 0;
+  const answer = args.answer?.trim();
+  const newLabel = args.new_label?.trim();
+  if (action === 'add') {
+    if (treatments && !priceValid) return 'Indica un precio válido en MXN.';
+    if (!treatments && !answer) return 'Indica la respuesta de la pregunta.';
+    const values: Record<string, unknown> = treatments ? { name: label, price: args.price } : { question: label, answer };
+    const existing = await findCatalogEntries(catalog, label);
+    if (existing.some(item => normalized(item.label) === normalized(label))) return 'Ya existe una opción activa con ese nombre.';
+    await db.from(catalog).insert(values).throwOnError();
+    return 'Opción guardada.';
+  }
+  if (action !== 'update' && action !== 'delete') return 'Acción desconocida.';
+  const entries = await findCatalogEntries(catalog, label);
+  if (entries.length !== 1) return { mensaje: 'Identifica una sola opción.', coincidencias: entries.map(item => item.label) };
+  const changes: Record<string, unknown> = {};
+  if (action === 'delete') changes.is_active = false;
+  else {
+    if (newLabel && newLabel.length <= 250) changes[field] = newLabel;
+    if (treatments && priceValid) changes.price = args.price;
+    if (!treatments && answer) changes.answer = answer;
+  }
+  if (!Object.keys(changes).length) return 'Faltan datos válidos para el cambio.';
+  const { data } = await db.from(catalog).update(changes).eq('id', entries[0].id).eq('is_active', true).select('id').maybeSingle().throwOnError();
+  return data ? (action === 'delete' ? 'Opción retirada del catálogo.' : 'Opción actualizada.') : 'La opción ya no está activa.';
+}
 
-    const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }, { role: 'user', content: text }];
-    let finalReply = '';
-    let hasSentUI = false;
-
-    for (let step = 0; step < 5; step++) {
-      const completion = await openai.chat.completions.create({ model: ADMIN_MODEL, temperature: 0.1, messages, tools: ADMIN_TOOLS, tool_choice: 'auto' });
-      const assistantMessage = completion.choices[0]?.message;
-      if (!assistantMessage) break;
-      messages.push(assistantMessage);
-
-      if (!assistantMessage.tool_calls?.length) {
-        finalReply = assistantMessage.content || 'Completado.';
-        break;
-      }
-
-      for (const toolCall of assistantMessage.tool_calls) {
-        if (toolCall.type !== 'function') continue;
-        const name = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments || '{}');
-        let output = '';
-
-        try {
-          if (name === 'show_admin_menu') {
-            await sendWhatsAppInteractiveList({
-              to: from, bodyText: '🩺 *Panel de Administrador*\n¿En qué te puedo asistir hoy?', buttonText: 'Abrir Panel',
-              sections: [
-                { title: 'Base de Datos (Tratamientos)', rows: [{ id: 'adm_add_treatment', title: 'Agregar Tratamiento' }, { id: 'adm_edit_treatment', title: 'Editar/Borrar Trat.' }] },
-                { title: 'Base de Datos (Info/FAQs)', rows: [{ id: 'adm_add_faq', title: 'Agregar Info/FAQ' }, { id: 'adm_edit_faq', title: 'Editar/Borrar FAQ' }] },
-                { title: 'Agenda y Chat', rows: [{ id: 'admin_agenda', title: 'Ver Citas de Hoy' }, { id: 'admin_cancelar', title: 'Cancelar Cita' }, { id: 'admin_cerrar_chat', title: 'Terminar chat directo' }] }
-              ]
-            });
-            hasSentUI = true; output = 'Menú enviado.';
-          } else if (name === 'manage_treatments') {
-            if (args.action === 'list') {
-              const { data } = await supabase.from('treatments').select('*').eq('is_active', true);
-              output = JSON.stringify(data || []);
-            } else if (args.action === 'add') {
-              await supabase.from('treatments').insert({ name: args.name, price: args.price }); output = 'Tratamiento guardado en BD.';
-            } else if (args.action === 'update') {
-              await supabase.from('treatments').update({ price: args.price }).ilike('name', `%${args.name}%`); output = 'Precio actualizado en BD.';
-            } else if (args.action === 'delete') {
-              await supabase.from('treatments').delete().ilike('name', `%${args.name}%`); output = 'Tratamiento eliminado de BD.';
-            }
-          } else if (name === 'manage_faqs') {
-            if (args.action === 'list') {
-              const { data } = await supabase.from('faqs').select('*').eq('is_active', true);
-              output = JSON.stringify(data || []);
-            } else if (args.action === 'add') {
-              await supabase.from('faqs').insert({ question: args.question, answer: args.answer }); output = 'FAQ guardado en BD.';
-            } else if (args.action === 'update') {
-              await supabase.from('faqs').update({ answer: args.answer }).ilike('question', `%${args.question}%`); output = 'FAQ actualizado.';
-            } else if (args.action === 'delete') {
-              await supabase.from('faqs').delete().ilike('question', `%${args.question}%`); output = 'FAQ eliminado.';
-            }
-          } else if (name === 'get_today_schedule') {
-            const startIso = new Date(`${args.date_str}T00:00:00-06:00`).toISOString();
-            const endIso = new Date(`${args.date_str}T23:59:59-06:00`).toISOString();
-            const appts = await getAppointmentsByDateRange(startIso, endIso);
-            output = JSON.stringify(appts.length ? appts : { message: 'No hay citas en esta fecha.' });
-          } else if (name === 'cancel_patient_appointments') {
-            for (const id of args.event_ids) {
-              await cancelCalendarEvent(id);
-            }
-            output = 'Citas canceladas exitosamente en Google Calendar.';
-          }
-        } catch (err) { output = JSON.stringify({ error: String(err) }); }
-        messages.push({ role: 'tool', tool_call_id: toolCall.id, content: output });
-      }
+export async function runAdminAgent(from: string, content: string) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12_000, maxRetries: 0 });
+  const messages: ChatCompletionMessageParam[] = [
+    { role: 'system', content: `Eres Benson, el asistente operativo interno. En la clínica hoy es ${clinicDate()}.
+Usa las herramientas para consultar agenda, preparar cancelaciones, gestionar tratamientos y FAQs y anotar pendientes. Solo modifica registros a petición explícita. Para cancelar pide fecha y nombre u hora, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. El botón confirma la cancelación. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
+    { role: 'user', content },
+  ];
+  for (let turn = 0; turn < 4; turn++) {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini', temperature: 0.1, messages, tools, parallel_tool_calls: false,
+    });
+    const message = response.choices[0]?.message;
+    if (!message) break;
+    messages.push(message);
+    if (!message.tool_calls?.length) {
+      await sendWhatsAppText(from, message.content || 'Escribe «Ayuda» para ver el panel.');
+      return;
     }
-    if (!hasSentUI && finalReply) await sendWhatsAppText(from, finalReply);
-  } catch (error) { console.error('[Admin Error]:', error); }
+    for (const tool of message.tool_calls) {
+      if (tool.type !== 'function') continue;
+      const name = tool.function.name;
+      const args = JSON.parse(tool.function.arguments);
+      let result: unknown = 'Acción desconocida';
+      if (name === 'schedule') {
+        await showSchedule(from, args.date || clinicDate());
+        return;
+      }
+      if (name === 'find_cancellation') {
+        const date = args.date as string;
+        const patient = typeof args.patient === 'string' ? normalized(args.patient) : '';
+        const time = typeof args.time === 'string' ? args.time : '';
+        if (!date || (!patient && !time)) result = 'Falta la fecha y el nombre u hora.';
+        else {
+          const formatter = new Intl.DateTimeFormat('en-GB', {
+            timeZone: process.env.CLINIC_TIMEZONE || 'America/Mexico_City', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+          });
+          const matches = (await getAppointmentsByDateRange(...clinicDayRange(date))).filter(event =>
+            Date.parse(event.start) > Date.now()
+            && (!patient || normalized(event.summary).includes(patient))
+            && (!time || formatter.format(new Date(event.start)) === time),
+          );
+          if (matches.length === 1) {
+            await proposeAppointmentAction(from, { action: 'cancel_clinic', details: matches[0] });
+            return;
+          }
+          result = { coincidencias: matches.slice(0, 10).map(event => `${event.summary} — ${formatAppointment(event.start)}`) };
+        }
+      }
+      if (name === 'manage_catalog') result = await manageCatalog(args);
+      if (name === 'add_task') {
+        const description = typeof args.description === 'string' ? args.description.trim() : '';
+        if (!description || description.length > 1500) result = 'Indica el pendiente en un mensaje breve.';
+        else {
+          await db.from('clinic_tasks').insert({ description }).throwOnError();
+          result = 'Pendiente guardado.';
+        }
+      }
+      messages.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify(result) });
+    }
+  }
+  await showAdminMenu(from);
 }
