@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-// Intentamos usar la llave maestra; si Vercel falla, usamos la pública como respaldo
+// Intenta usar la llave service_role para permisos totales
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 export const supabaseAdmin = createClient(supabaseUrl, supabaseKey, {
