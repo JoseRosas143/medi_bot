@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
-import { supabaseAdmin as supabase } from '@/lib/supabase';
+import { supabaseAdmin } from '@/lib/supabase';
 import { sendWhatsAppText, sendWhatsAppInteractiveList, sendWhatsAppInteractiveButtons } from '@/lib/whatsapp';
 import { searchKnowledge } from '@/lib/knowledge';
 import { getAvailableSlots, createCalendarAppointment, getPatientAppointments, cancelCalendarEvent } from '@/lib/calendar';
@@ -10,84 +10,41 @@ const PATIENT_MODEL = 'gpt-4o-mini';
 const TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
 
 const PATIENT_TOOLS: ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'show_interactive_menu',
-      description: 'Muestra la lista de opciones (menú nativo) al paciente.',
-      parameters: { type: 'object', properties: { greeting_text: { type: 'string' } }, required: ['greeting_text'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'send_confirmation_buttons',
-      description: 'Muestra botones Sí/No nativos para confirmar citas o acciones.',
-      parameters: { type: 'object', properties: { message: { type: 'string' }, buttons: { type: 'array', items: { type: 'string' } } }, required: ['message', 'buttons'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'consult_clinic_info',
-      description: 'Resuelve dudas médicas o consultas sobre FAQS y precios usando RAG.',
-      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'save_patient_onboarding',
-      description: 'Guarda o actualiza la ficha del paciente tras recopilar sus datos.',
-      parameters: { type: 'object', properties: { full_name: { type: 'string' }, age: { type: 'integer' }, allergies_or_meds: { type: 'string' } }, required: ['full_name'] }
-    }
-  },
-  {
-    type: 'function',
-    function: { name: 'check_calendar_availability', description: 'Revisa horas libres.', parameters: { type: 'object', properties: { date_str: { type: 'string' } }, required: ['date_str'] } }
-  },
-  {
-    type: 'function',
-    function: { name: 'book_calendar_appointment', description: 'Agenda la cita.', parameters: { type: 'object', properties: { start_time: { type: 'string' }, end_time: { type: 'string' }, reason: { type: 'string' }, is_urgent: { type: 'boolean' } }, required: ['start_time', 'end_time', 'reason', 'is_urgent'] } }
-  },
-  {
-    type: 'function',
-    function: { name: 'get_my_appointments', description: 'Lista las citas futuras de este paciente para que elija cuál cancelar/reagendar.', parameters: { type: 'object', properties: {}, required: [] } }
-  },
-  {
-    type: 'function',
-    function: { name: 'cancel_my_appointment', description: 'Cancela cita usando el eventId.', parameters: { type: 'object', properties: { event_id: { type: 'string' } }, required: ['event_id'] } }
-  },
-  {
-    type: 'function',
-    function: { name: 'escalate_to_doctor', description: 'Pasa el chat al profesional.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } }
-  }
+  { type: 'function', function: { name: 'show_interactive_menu', description: 'Muestra el menú visual al paciente.', parameters: { type: 'object', properties: { greeting_text: { type: 'string' } }, required: ['greeting_text'] } } },
+  { type: 'function', function: { name: 'send_confirmation_buttons', description: 'Muestra botones Sí/No.', parameters: { type: 'object', properties: { message: { type: 'string' }, buttons: { type: 'array', items: { type: 'string' } } }, required: ['message', 'buttons'] } } },
+  { type: 'function', function: { name: 'consult_clinic_info', description: 'Resuelve dudas médicas o precios.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'save_patient_onboarding', description: 'Guarda los datos del paciente.', parameters: { type: 'object', properties: { full_name: { type: 'string' }, age: { type: 'integer' }, allergies_or_meds: { type: 'string' } }, required: ['full_name'] } } },
+  { type: 'function', function: { name: 'check_calendar_availability', description: 'Revisa horas libres.', parameters: { type: 'object', properties: { date_str: { type: 'string' } }, required: ['date_str'] } } },
+  { type: 'function', function: { name: 'book_calendar_appointment', description: 'Agenda la cita.', parameters: { type: 'object', properties: { start_time: { type: 'string' }, end_time: { type: 'string' }, reason: { type: 'string' }, is_urgent: { type: 'boolean' } }, required: ['start_time', 'end_time', 'reason', 'is_urgent'] } } },
+  { type: 'function', function: { name: 'get_my_appointments', description: 'Lista citas del paciente.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'cancel_my_appointment', description: 'Cancela cita.', parameters: { type: 'object', properties: { event_id: { type: 'string' } }, required: ['event_id'] } } },
+  { type: 'function', function: { name: 'escalate_to_doctor', description: 'Pasa el chat al profesional.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } }
 ];
 
 export async function runPatientAgent(payload: { from: string; content: string }): Promise<void> {
   const { from, content: text } = payload;
   try {
-    let { data: patient } = await supabase.from('patients').select('*').eq('phone', from).maybeSingle();
+    // 1. Crear o recuperar paciente usando explícitamente supabaseAdmin
+    let { data: patient } = await supabaseAdmin.from('patients').select('*').eq('phone', from).maybeSingle();
     if (!patient) {
-      const { data: created } = await supabase.from('patients').insert({ phone: from, chat_mode: 'AI_ACTIVE' }).select('*').single();
+      const { data: created } = await supabaseAdmin.from('patients').insert({ phone: from, chat_mode: 'AI_ACTIVE' }).select('*').single();
       patient = created;
     }
 
-    const { data: settings } = await supabase.from('bot_settings').select('*').eq('id', 1).single();
-    await supabase.from('chat_messages').insert({ patient_phone: from, role: 'user', content: text });
+    const { data: settings } = await supabaseAdmin.from('bot_settings').select('*').eq('id', 1).single();
+    await supabaseAdmin.from('chat_messages').insert({ patient_phone: from, role: 'user', content: text });
 
-    const historyRes = await supabase.from('chat_messages').select('role, content').eq('patient_phone', from).order('created_at', { ascending: false }).limit(10);
+    const historyRes = await supabaseAdmin.from('chat_messages').select('role, content').eq('patient_phone', from).order('created_at', { ascending: false }).limit(10);
     const history = (historyRes.data || []).reverse().map(msg => ({ role: msg.role as 'user' | 'assistant', content: msg.content }));
     
     const systemPrompt = `Eres "${settings?.bot_name || 'Asistente'}", representante de "${settings?.clinic_specialty || 'la clínica'}". 
 Fecha: ${new Date().toLocaleString('es-MX', { timeZone: TIMEZONE })}.
 Paciente actual: ${patient?.full_name || 'Pendiente'}.
 
-REGLAS ESTRICTAS:
-1. Si Paciente actual es "Pendiente" y el usuario saluda, DEBES presentarte y preguntarle cómo se llama. No ofrezcas menús aún.
-2. Cuando el usuario diga su nombre, ejecuta 'save_patient_onboarding' y luego INMEDIATAMENTE ejecuta 'show_interactive_menu' con un saludo que incluya su nombre.
-3. NO escribas listas de opciones en texto; siempre usa 'show_interactive_menu' para eso.
-4. Antes de confirmar cita o cancelación, usa 'send_confirmation_buttons'.`;
+REGLAS:
+1. Si Paciente es "Pendiente" y saluda, DEBES presentarte y preguntarle cómo se llama.
+2. Al recibir el nombre, usa 'save_patient_onboarding' y luego INMEDIATAMENTE ejecuta 'show_interactive_menu' para darle opciones.
+3. No escribas listas; siempre usa 'show_interactive_menu'.`;
 
     const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }, ...history];
     if (history.length === 0 || history[history.length - 1].content !== text) messages.push({ role: 'user', content: text });
@@ -130,7 +87,7 @@ REGLAS ESTRICTAS:
             const matches = await searchKnowledge(args.query, 4, 0.45);
             output = JSON.stringify(matches.length ? matches : { error: 'No se encontró información' });
           } else if (name === 'save_patient_onboarding') {
-            await supabase.from('patients').update({ full_name: args.full_name, age: args.age, allergies_or_meds: args.allergies_or_meds }).eq('phone', from);
+            await supabaseAdmin.from('patients').update({ full_name: args.full_name, age: args.age, allergies_or_meds: args.allergies_or_meds }).eq('phone', from);
             output = 'Datos guardados.';
           } else if (name === 'check_calendar_availability') {
             output = JSON.stringify(await getAvailableSlots(args.date_str));
@@ -141,10 +98,9 @@ REGLAS ESTRICTAS:
           } else if (name === 'cancel_my_appointment') {
             await cancelCalendarEvent(args.event_id); output = 'Cita cancelada.';
           } else if (name === 'escalate_to_doctor') {
-            await supabase.from('patients').update({ chat_mode: 'WAITING_HUMAN' }).eq('phone', from);
+            await supabaseAdmin.from('patients').update({ chat_mode: 'WAITING_HUMAN' }).eq('phone', from);
             if (process.env.ADMIN_PHONE_NUMBER) {
-              const wamid = await sendWhatsAppText(String(process.env.ADMIN_PHONE_NUMBER), `🩺 *Consulta de ${patient?.full_name || from}:*\n"${args.summary}"\n\n_Desliza para responder._`);
-              await supabase.from('escalation_mappings').upsert({ wa_message_id: wamid, patient_phone: from });
+              await sendWhatsAppText(String(process.env.ADMIN_PHONE_NUMBER), `🩺 *Consulta de ${patient?.full_name || from}:*\n"${args.summary}"`);
             }
             output = 'Doctor notificado.';
           }
@@ -156,7 +112,7 @@ REGLAS ESTRICTAS:
 
     if (!hasSentUI && finalReply) {
       await sendWhatsAppText(from, finalReply);
-      await supabase.from('chat_messages').insert({ patient_phone: from, role: 'assistant', content: finalReply });
+      await supabaseAdmin.from('chat_messages').insert({ patient_phone: from, role: 'assistant', content: finalReply });
     }
   } catch (error) { console.error('[Patient Handler Error]:', error); }
 }
