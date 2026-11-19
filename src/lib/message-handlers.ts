@@ -1,5 +1,5 @@
 import { supabaseAdmin as supabase } from '@/lib/supabase';
-import { sendWhatsAppInteractiveList, sendWhatsAppText } from '@/lib/whatsapp';
+import { sendWhatsAppText } from '@/lib/whatsapp';
 import { runAdminAgent } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 
@@ -10,7 +10,6 @@ export type IncomingMessage = {
   contextMessageId?: string;
 };
 
-const GREETING_OR_MENU = /^(hola+|buen(os|as)\s+(d[ií]as|tardes|noches)|qu[eé]\s+tal|saludos|men[uú]|opciones|inicio|ayuda)[!?.¡¿\s]*$/i;
 const HUMAN_REQUEST = /\b(humano|persona|doctor|doctora|asesor|recepci[oó]n)\b/i;
 const EMERGENCY_WORDS = /\b(emergencia|urgencia|sangrado intenso|dificultad para respirar|dolor de pecho)\b/i;
 
@@ -31,52 +30,6 @@ async function replyToPatient(phone: string, content: string): Promise<string> {
   const messageId = await sendWhatsAppText(phone, content);
   await persistMessage(phone, 'assistant', content);
   return messageId;
-}
-
-async function sendWelcomeInteractiveMenu(phone: string): Promise<void> {
-  const { data: settings } = await supabase
-    .from('bot_settings')
-    .select('bot_name, clinic_specialty')
-    .eq('id', 1)
-    .maybeSingle();
-
-  const botName = settings?.bot_name || 'Asistente Clínico';
-  const clinicName = settings?.clinic_specialty?.trim();
-
-  const presentation = clinicName
-    ? `¡Hola! Soy *${botName}*, tu asistente de la clínica *${clinicName}*. 👋\n\nTe puedo ayudar con lo siguiente (elige una opción de la lista o escríbeme directamente):`
-    : `¡Hola! Soy *${botName}*, tu asistente virtual de la clínica. 👋\n\nTe puedo ayudar con lo siguiente (elige una opción de la lista o escríbeme directamente):`;
-
-  await sendWhatsAppInteractiveList({
-    to: phone,
-    bodyText: presentation,
-    buttonText: 'Ver opciones',
-    footerText: 'Selecciona una opción para comenzar',
-    sections: [
-      {
-        title: 'Citas y Agenda',
-        rows: [
-          { id: 'menu_agendar', title: 'Agendar cita', description: 'Ver horarios disponibles y reservar consulta' },
-          { id: 'menu_cancelar', title: 'Cancelar o reagendar', description: 'Modificar o cancelar una cita programada' },
-        ],
-      },
-      {
-        title: 'Información y Costos',
-        rows: [
-          { id: 'menu_presupuesto', title: 'Precios y dudas', description: 'Consultar costos de consultas y tratamientos' },
-          { id: 'menu_faqs', title: 'Preguntas frecuentes', description: 'Horarios de atención, ubicación y formas de pago' },
-        ],
-      },
-      {
-        title: 'Atención Personal',
-        rows: [
-          { id: 'menu_doctor', title: 'Hablar con el doctor', description: 'Canalizar una consulta directa con el especialista' },
-        ],
-      },
-    ],
-  });
-
-  await persistMessage(phone, 'assistant', presentation);
 }
 
 async function notifyAdmin(
@@ -120,12 +73,6 @@ export async function handlePatientMessage(message: IncomingMessage): Promise<vo
   if (EMERGENCY_WORDS.test(message.content)) {
     await persistMessage(message.from, 'user', message.content);
     await replyToPatient(message.from, 'Si presentas una emergencia, llama al servicio local de emergencias o acude a urgencias de inmediato. Este chat no sustituye atención médica de emergencia.');
-    return;
-  }
-
-  if (GREETING_OR_MENU.test(message.content.trim())) {
-    await persistMessage(message.from, 'user', message.content);
-    await sendWelcomeInteractiveMenu(message.from);
     return;
   }
 
