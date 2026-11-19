@@ -1,87 +1,106 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { handlePatientMessage, handleAdminMessage } from '@/lib/message-handlers';
+import { supabaseAdmin as db } from '@/lib/supabase';
+import { transcribeWhatsAppAudio } from '@/lib/audio';
+import { recordNoticeStatus } from '@/lib/appointment-notices';
+import { isWhatsAppPhone, phoneDigits, sendWhatsAppText } from '@/lib/whatsapp';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
-// Memoria temporal en el servidor para evitar procesar mensajes duplicados (reintentos de WhatsApp)
-const processedMessages = new Set<string>();
+type Reply = { id?: string; title?: string };
+type WhatsAppMessage = {
+  id: string; from: string; timestamp?: string; type: string;
+  context?: { id?: string }; text?: { body?: string }; audio?: { id?: string };
+  interactive?: { list_reply?: Reply; button_reply?: Reply };
+};
+type WhatsAppPayload = {
+  object?: string;
+  entry?: Array<{ changes?: Array<{ field?: string; value?: {
+    metadata?: { phone_number_id?: string }; messages?: WhatsAppMessage[];
+    statuses?: Array<{ id: string; status: string }>;
+  } }> }>;
+};
 
 export async function GET(request: Request) {
-  const url = new URL(request.url);
-  const mode = url.searchParams.get('hub.mode');
-  const token = url.searchParams.get('hub.verify_token');
-  const challenge = url.searchParams.get('hub.challenge');
-
-  if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-    return new NextResponse(challenge, { status: 200 });
+  const params = new URL(request.url).searchParams;
+  const token = process.env.WHATSAPP_VERIFY_TOKEN;
+  const challenge = params.get('hub.challenge');
+  if (token && challenge && params.get('hub.mode') === 'subscribe' && params.get('hub.verify_token') === token) {
+    return new NextResponse(challenge);
   }
   return new NextResponse('Forbidden', { status: 403 });
 }
 
-export async function POST(request: Request) {
+function validSignature(body: Buffer, signature: string | null, secret: string) {
+  if (!signature || !/^sha256=[a-f0-9]{64}$/i.test(signature)) return false;
+  return timingSafeEqual(Buffer.from(signature.slice(7), 'hex'), createHmac('sha256', secret).update(body).digest());
+}
+
+async function processMessage(message: WhatsAppMessage) {
+  if (!message.id || !isWhatsAppPhone(message.from)) return;
+  const reply = message.interactive?.list_reply || message.interactive?.button_reply;
+  const text = message.type === 'text' ? message.text?.body : message.type === 'interactive' ? reply?.title : undefined;
+  const mediaId = message.type === 'audio' ? message.audio?.id : undefined;
+  if (!text?.trim() && !mediaId && !reply?.id) return;
+  const { error } = await db.from('whatsapp_receipts').insert({ message_id: message.id });
+  if (error?.code === '23505') return;
+  if (error) throw error;
+
+  let state = 'processed';
   try {
-    const body = await request.json();
-
-    if (body.object === 'whatsapp_business_account') {
-      const entry = body.entry?.[0];
-      const changes = entry?.changes?.[0];
-      const value = changes?.value;
-      const message = value?.messages?.[0];
-
-      if (message) {
-        const messageId = message.id;
-
-        // --- SISTEMA DE DEDUPLICACIÓN ---
-        // Si ya vimos este ID de mensaje en los últimos minutos, lo ignoramos para evitar que la IA se vuelva loca
-        if (processedMessages.has(messageId)) {
-          return NextResponse.json({ status: 'ignored_duplicate' });
-        }
-        
-        // Guardamos el ID del mensaje y limitamos el tamaño de la memoria para que el servidor no se sature
-        processedMessages.add(messageId);
-        if (processedMessages.size > 1000) {
-          processedMessages.clear();
-        }
-
-        const from = message.from;
-        const contextMessageId = message.context?.id;
-        
-        let content = '';
-
-        // 1. Extraer texto normal
-        if (message.type === 'text') {
-          content = message.text.body;
-        } 
-        // 2. Extraer clics en botones o listas interactivas
-        else if (message.type === 'interactive') {
-          content = message.interactive?.list_reply?.title || message.interactive?.button_reply?.title || '';
-        } 
-        // 3. Soporte para audios (opcional a futuro)
-        else if (message.type === 'audio') {
-          content = '[Nota de voz recibida - Requiere procesamiento de audio]';
-        }
-
-        // Si extrajimos contenido válido, se lo pasamos al agente correspondiente
-        if (content) {
-          const incomingMessage = { from, messageId, content, contextMessageId };
-
-          // IMPORTANTE: Responder con 200 INMEDIATAMENTE para que WhatsApp no haga reintentos,
-          // y ejecutar la IA de forma asíncrona sin bloquear la respuesta.
-          if (from === process.env.ADMIN_PHONE_NUMBER) {
-            handleAdminMessage(incomingMessage).catch(console.error);
-          } else {
-            handlePatientMessage(incomingMessage).catch(console.error);
-          }
-        }
+    let content = text?.trim() || '';
+    if (mediaId) {
+      try {
+        content = await transcribeWhatsAppAudio(mediaId);
+      } catch {
+        await sendWhatsAppText(message.from, 'No pude entender la nota de voz. ¿Puedes escribir tu mensaje o grabarlo de nuevo?');
+        await db.from('whatsapp_receipts').update({ status: 'failed' }).eq('message_id', message.id).throwOnError();
+        return;
       }
-      
-      // WhatsApp exige un 200 OK rápido para no volver a enviar el webhook
-      return NextResponse.json({ status: 'ok' });
     }
-    
-    return new NextResponse('Not Found', { status: 404 });
+    const payload = {
+      from: message.from, messageId: message.id, content, optionId: reply?.id,
+      contextMessageId: message.context?.id, timestamp: message.timestamp,
+    };
+    if (message.from === phoneDigits(process.env.ADMIN_PHONE_NUMBER)) await handleAdminMessage(payload);
+    else await handlePatientMessage(payload);
   } catch (error) {
-    console.error('Webhook Error:', error);
-    return new NextResponse('Internal Error', { status: 500 });
+    state = 'failed';
+    console.error('WhatsApp handler failed', { type: message.type, error: error instanceof Error ? error.name : 'database' });
+    await sendWhatsAppText(message.from, 'Tu solicitud quedó sin confirmar. Si era sobre una cita, consulta su estado antes de volver a intentarlo.')
+      .catch(() => undefined);
+  }
+
+  await db.from('whatsapp_receipts').update({ status: state }).eq('message_id', message.id).throwOnError();
+}
+
+export async function POST(request: Request) {
+  const secret = process.env.WHATSAPP_APP_SECRET;
+  if (!secret || !process.env.WHATSAPP_PHONE_NUMBER_ID) return new NextResponse('Unavailable', { status: 503 });
+  const raw = Buffer.from(await request.arrayBuffer());
+  if (!validSignature(raw, request.headers.get('x-hub-signature-256'), secret)) {
+    return new NextResponse('Forbidden', { status: 403 });
+  }
+
+  let body: WhatsAppPayload;
+  try { body = JSON.parse(raw.toString('utf8')); }
+  catch { return new NextResponse('Invalid JSON', { status: 400 }); }
+  if (body?.object !== 'whatsapp_business_account') return new NextResponse('Not Found', { status: 404 });
+
+  try {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value;
+        if (change.field !== 'messages' || value?.metadata?.phone_number_id !== process.env.WHATSAPP_PHONE_NUMBER_ID) continue;
+        for (const status of value.statuses || []) await recordNoticeStatus(status.id, status.status);
+        for (const message of value.messages || []) await processMessage(message);
+      }
+    }
+    return NextResponse.json({ status: 'ok' });
+  } catch {
+    console.error('WhatsApp webhook could not persist processing state');
+    return new NextResponse('Unavailable', { status: 503 });
   }
 }

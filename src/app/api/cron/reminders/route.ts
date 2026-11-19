@@ -1,59 +1,37 @@
+import { timingSafeEqual } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { getAppointmentsByDateRange } from '@/lib/calendar';
-import { sendWhatsAppTemplate } from '@/lib/whatsapp';
-import { supabaseAdmin } from '@/lib/supabase';
+import { clinicDate, clinicDayRange, nextDate } from '@/lib/clinic-time';
+import { sendAppointmentNotice } from '@/lib/appointment-notices';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 export async function GET(request: Request) {
-  const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  const secret = process.env.CRON_SECRET;
+  const token = Buffer.from(request.headers.get('authorization') || '');
+  const expected = Buffer.from(`Bearer ${secret}`);
+  if (!secret || token.length !== expected.length || !timingSafeEqual(token, expected)) {
     return new NextResponse('No autorizado', { status: 401 });
   }
 
   try {
-    const now = new Date();
-    const startIso = new Date(now.getTime() + 23 * 60 * 60 * 1000).toISOString();
-    const endIso = new Date(now.getTime() + 25 * 60 * 60 * 1000).toISOString();
-
-    const appointments = await getAppointmentsByDateRange(startIso, endIso);
-    let sent = 0;
-
-    for (const appt of appointments) {
-      if (!appt.patientPhone) continue;
-
-      // Variables locales procesadas a partir de la interfaz de CalendarEventData
-      const localPatientName = appt.summary.replace(/\[URGENTE\]\s*Cita:\s*/i, '').replace(/Cita:\s*/i, '') || 'Paciente';
-      const dateObj = new Date(appt.start);
-      const localFormattedTime = new Intl.DateTimeFormat('es-MX', {
-        timeZone: process.env.CLINIC_TIMEZONE || 'America/Mexico_City',
-        weekday: 'long',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true
-      }).format(dateObj);
-
-      try {
-        await sendWhatsAppTemplate(
-          appt.patientPhone,
-          'cita_recordatorio',
-          [localPatientName, 'nuestra clínica', localFormattedTime]
-        );
-        
-        await supabaseAdmin.from('chat_messages').insert({
-          patient_phone: appt.patientPhone,
-          role: 'assistant',
-          content: `⏰ Recordatorio automático enviado para la cita del ${localFormattedTime}.`
-        });
-        sent++;
-      } catch (err) {
-        console.warn(`[Cron] Falló recordatorio para ${appt.patientPhone}:`, err);
+    const date = nextDate(clinicDate());
+    const [start, end] = clinicDayRange(date);
+    const appointments = (await getAppointmentsByDateRange(start, end))
+      .filter(event => Date.parse(event.start) >= Date.parse(start) && Date.parse(event.start) < Date.parse(end));
+    const counts: Record<string, number> = {};
+    for (let index = 0; index < appointments.length; index += 5) {
+      const results = await Promise.allSettled(appointments.slice(index, index + 5).map(event => sendAppointmentNotice(event, 'reminder')));
+      for (const result of results) {
+        const state = result.status === 'fulfilled' ? result.value : 'error';
+        counts[state] = (counts[state] ?? 0) + 1;
       }
     }
-
-    return NextResponse.json({ success: true, reminders_sent: sent });
-  } catch (error) {
-    console.error('[Cron Error]:', error);
-    return NextResponse.json({ success: false, error: String(error) }, { status: 500 });
+    const success = !counts.rejected && !counts.uncertain && !counts.error && !counts.not_configured;
+    return NextResponse.json({ success, date, counts }, { status: success ? 200 : 502 });
+  } catch {
+    console.error('Reminder run failed before processing notices');
+    return NextResponse.json({ success: false }, { status: 500 });
   }
 }
