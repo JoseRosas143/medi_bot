@@ -9,17 +9,23 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const PATIENT_MODEL = 'gpt-4o-mini';
 const TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
 
-// Bloqueo para evitar que Vercel cachee la fecha 
 export const dynamic = 'force-dynamic';
 
 const PATIENT_TOOLS: ChatCompletionTool[] = [
-  { type: 'function', function: { name: 'show_interactive_menu', description: 'Muestra el menú visual.', parameters: { type: 'object', properties: { greeting_text: { type: 'string' } }, required: ['greeting_text'] } } },
+  { 
+    type: 'function', 
+    function: { 
+      name: 'show_menu', 
+      description: 'Despliega listas de opciones. Tipos válidos: "principal", "tratamientos", "faqs".', 
+      parameters: { type: 'object', properties: { menu_type: { type: 'string', enum: ['principal', 'tratamientos', 'faqs'] }, message: { type: 'string' } }, required: ['menu_type', 'message'] } 
+    } 
+  },
   { type: 'function', function: { name: 'send_confirmation_buttons', description: 'Botones Sí/No.', parameters: { type: 'object', properties: { message: { type: 'string' }, buttons: { type: 'array', items: { type: 'string' } } }, required: ['message', 'buttons'] } } },
-  { type: 'function', function: { name: 'consult_clinic_info', description: 'Busca info médica, tratamientos y precios.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'save_patient_onboarding', description: 'Guarda nombre.', parameters: { type: 'object', properties: { full_name: { type: 'string' }, age: { type: 'integer' }, allergies_or_meds: { type: 'string' } }, required: ['full_name'] } } },
+  { type: 'function', function: { name: 'consult_clinic_info', description: 'Busca info médica, tratamientos y precios específicos.', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'save_patient_onboarding', description: 'Guarda datos.', parameters: { type: 'object', properties: { full_name: { type: 'string' }, age: { type: 'integer' }, allergies_or_meds: { type: 'string' } }, required: ['full_name'] } } },
   { type: 'function', function: { name: 'check_calendar_availability', description: 'Revisa horas.', parameters: { type: 'object', properties: { date_str: { type: 'string' } }, required: ['date_str'] } } },
   { type: 'function', function: { name: 'book_calendar_appointment', description: 'Agenda cita.', parameters: { type: 'object', properties: { start_time: { type: 'string' }, end_time: { type: 'string' }, reason: { type: 'string' }, is_urgent: { type: 'boolean' } }, required: ['start_time', 'end_time', 'reason', 'is_urgent'] } } },
-  { type: 'function', function: { name: 'get_my_appointments', description: 'Lista citas futuras.', parameters: { type: 'object', properties: {}, required: [] } } },
+  { type: 'function', function: { name: 'get_my_appointments', description: 'Lista citas.', parameters: { type: 'object', properties: {}, required: [] } } },
   { type: 'function', function: { name: 'cancel_my_appointment', description: 'Cancela cita.', parameters: { type: 'object', properties: { event_id: { type: 'string' } }, required: ['event_id'] } } },
   { type: 'function', function: { name: 'escalate_to_doctor', description: 'Llama al humano.', parameters: { type: 'object', properties: { summary: { type: 'string' } }, required: ['summary'] } } }
 ];
@@ -39,17 +45,19 @@ export async function runPatientAgent(payload: { from: string; content: string }
     const historyRes = await supabase.from('chat_messages').select('role, content').eq('patient_phone', from).order('created_at', { ascending: false }).limit(10);
     const history = (historyRes.data || []).reverse().map(msg => ({ role: msg.role as 'user' | 'assistant', content: msg.content }));
     
+    // Obtenemos la fecha forzada en el huso horario actual para evitar alucinaciones
     const fechaActual = new Date().toLocaleString('es-MX', { timeZone: TIMEZONE, dateStyle: 'full', timeStyle: 'short' });
 
     const systemPrompt = `Eres "${settings?.bot_name || 'Asistente'}" de "${settings?.clinic_specialty || 'la clínica'}". 
-FECHA ACTUAL: ${fechaActual}. BAJO NINGUNA CIRCUNSTANCIA DIGAS QUE ES 2023. USA ESTA FECHA EXACTA.
+FECHA ACTUAL GARANTIZADA: ${fechaActual}. PROHIBIDO mencionar fechas de 2023. El sistema actual ya te ha proveído el tiempo exacto.
 Paciente actual: ${patient?.full_name || 'Pendiente'}.
 
-REGLAS ESTRICTAS:
-1. Si el Paciente es "Pendiente", preséntate y pregunta su nombre.
-2. Cuando diga su nombre, usa 'save_patient_onboarding' y muestra opciones con 'show_interactive_menu'.
-3. SI EL PACIENTE TOCA "Tratamientos/Precios" EN EL MENÚ: NO busques nada en la base de conocimientos aún. Pregúntale amablemente "¿Qué tratamiento te interesa?" o "¿Sobre qué necesitas información?".
-4. Cuando el paciente pregunte algo específico (ej. "Cuánto cuesta una resina"), usa 'consult_clinic_info' enviando las palabras clave ("precio resina").`;
+REGLAS DE SUB-MENÚS (CASCADA):
+1. ONBOARDING: Si el Paciente es "Pendiente", preséntate y pregunta su nombre de inmediato.
+2. MENÚ PRINCIPAL: Cuando diga su nombre o pida opciones, usa 'save_patient_onboarding' y luego ejecuta 'show_menu' con menu_type='principal'.
+3. ACCIÓN "Tratamientos/Precios": Si el usuario toca esta opción, NO uses consult_clinic_info; DEBES ejecutar 'show_menu' con menu_type='tratamientos'.
+4. ACCIÓN "Info y Políticas": Si toca esta opción, NO uses consult_clinic_info; DEBES ejecutar 'show_menu' con menu_type='faqs'.
+5. BÚSQUEDA VECTORIAL: Solo cuando el paciente seleccione un tratamiento específico de la sub-lista (ej. "Limpieza Dental", "Resinas") o una FAQ ("Horarios"), usarás 'consult_clinic_info' para buscar esa información exacta y decírsela.`;
 
     const messages: ChatCompletionMessageParam[] = [{ role: 'system', content: systemPrompt }, ...history];
     if (history.length === 0 || history[history.length - 1].content !== text) messages.push({ role: 'user', content: text });
@@ -58,7 +66,7 @@ REGLAS ESTRICTAS:
     let hasSentUI = false;
 
     for (let step = 0; step < 5; step++) {
-      const completion = await openai.chat.completions.create({ model: PATIENT_MODEL, temperature: 0.2, messages, tools: PATIENT_TOOLS, tool_choice: 'auto' });
+      const completion = await openai.chat.completions.create({ model: PATIENT_MODEL, temperature: 0.1, messages, tools: PATIENT_TOOLS, tool_choice: 'auto' });
       const assistantMsg = completion.choices[0]?.message;
       if (!assistantMsg) break;
       messages.push(assistantMsg);
@@ -75,25 +83,37 @@ REGLAS ESTRICTAS:
         let output = '';
 
         try {
-          if (name === 'show_interactive_menu') {
-            await sendWhatsAppInteractiveList({
-              to: from, bodyText: args.greeting_text, buttonText: 'Opciones',
-              sections: [
+          if (name === 'show_menu') {
+            let sections: any[] = [];
+            
+            if (args.menu_type === 'principal') {
+              sections = [
                 { title: 'Consultas', rows: [{ id: 'agendar', title: 'Agendar cita' }, { id: 'urgencia', title: 'Cita urgente' }, { id: 'cancelar', title: 'Cancelar/Reagendar' }] },
-                { title: 'Servicios', rows: [{ id: 'precios', title: 'Tratamientos/Precios' }, { id: 'faqs', title: 'Info y Políticas' }] },
+                { title: 'Servicios de la Clínica', rows: [{ id: 'menu_tratamientos', title: 'Tratamientos/Precios' }, { id: 'menu_faqs', title: 'Info y Políticas' }] },
                 { title: 'Atención Médica', rows: [{ id: 'doctor', title: 'Hablar con el doctor' }] }
-              ]
-            });
-            hasSentUI = true; output = 'Menú enviado.';
+              ];
+            } else if (args.menu_type === 'tratamientos') {
+              sections = [
+                { title: 'Comunes', rows: [{ id: 't_limpieza', title: 'Limpieza Dental' }, { id: 't_resina', title: 'Precio de Resinas' }, { id: 't_extraccion', title: 'Extracciones' }] },
+                { title: 'Especiales', rows: [{ id: 't_blanqueamiento', title: 'Blanqueamiento' }, { id: 't_ortodoncia', title: 'Ortodoncia/Brackets' }, { id: 't_radiografia', title: 'Radiografías' }] }
+              ];
+            } else if (args.menu_type === 'faqs') {
+              sections = [
+                { title: 'General', rows: [{ id: 'faq_horario', title: 'Horario de la clínica' }, { id: 'faq_ubicacion', title: '¿Dónde están ubicados?' }, { id: 'faq_pagos', title: 'Métodos de pago' }] },
+                { title: 'Más info', rows: [{ id: 'faq_cancelaciones', title: 'Política de cancelación' }] }
+              ];
+            }
+
+            await sendWhatsAppInteractiveList({ to: from, bodyText: args.message || 'Selecciona una opción:', buttonText: 'Ver opciones', sections });
+            hasSentUI = true; output = `Menú ${args.menu_type} enviado.`;
+            
           } else if (name === 'send_confirmation_buttons') {
             await sendWhatsAppInteractiveButtons({ to: from, bodyText: args.message, buttons: args.buttons });
             hasSentUI = true; output = 'Botones enviados.';
           } else if (name === 'consult_clinic_info') {
-            // Bajamos el umbral (threshold) de 0.45 a 0.15 para asegurar que sí encuentre la respuesta
-            let matches;
-            try { matches = await searchKnowledge(args.query, 4, 0.15); } 
-            catch (e) { matches = await searchKnowledge(args.query); }
-            output = JSON.stringify((matches && matches.length) ? matches : { error: 'No encontré esa info, ofrécele hablar con el doctor.' });
+            // Buscamos directamente con similitud baja para traer resultados seguros
+            let matches = await searchKnowledge(args.query, 4, 0.15);
+            output = JSON.stringify((matches && matches.length) ? matches : { error: 'No encontré esa info, avisa al doctor.' });
           } else if (name === 'save_patient_onboarding') {
             await supabase.from('patients').update({ full_name: args.full_name, age: args.age, allergies_or_meds: args.allergies_or_meds }).eq('phone', from);
             output = 'Datos guardados.';
@@ -108,10 +128,10 @@ REGLAS ESTRICTAS:
           } else if (name === 'escalate_to_doctor') {
             await supabase.from('patients').update({ chat_mode: 'WAITING_HUMAN' }).eq('phone', from);
             if (process.env.ADMIN_PHONE_NUMBER) {
-              const wamid = await sendWhatsAppText(String(process.env.ADMIN_PHONE_NUMBER), `🩺 *Consulta de ${patient?.full_name || from}:*\n"${args.summary}"\n\n_Desliza este mensaje y selecciona "Responder" para contestarle._`);
+              const wamid = await sendWhatsAppText(String(process.env.ADMIN_PHONE_NUMBER), `🩺 *Consulta de ${patient?.full_name || from}:*\n"${args.summary}"\n\n_Desliza este mensaje para responderle._`);
               await supabase.from('escalation_mappings').upsert({ wa_message_id: wamid, patient_phone: from });
             }
-            output = 'El doctor fue notificado, dile al paciente que espere.';
+            output = 'El doctor fue notificado.';
           }
         } catch (e) { output = JSON.stringify({ error: String(e) }); }
         
