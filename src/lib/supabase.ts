@@ -1,18 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 
-function requiredEnvironment(name: 'NEXT_PUBLIC_SUPABASE_URL' | 'SUPABASE_SERVICE_ROLE_KEY'): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.warn('⚠️ Faltan las credenciales de Supabase en las variables de entorno.');
 }
 
-/** Server-only Supabase client. Do not import this module from Client Components. */
-export const supabaseAdmin = createClient(
-  requiredEnvironment('NEXT_PUBLIC_SUPABASE_URL'),
-  requiredEnvironment('SUPABASE_SERVICE_ROLE_KEY'),
-  {
-    auth: { autoRefreshToken: false, persistSession: false },
+// Usamos estrictamente el SERVICE_ROLE_KEY para tener permisos de escritura absolutos
+// y saltarnos las políticas de seguridad (RLS) en el backend.
+export const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false,
   },
-);
+});
