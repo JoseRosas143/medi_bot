@@ -2,8 +2,7 @@ import { google } from 'googleapis';
 
 const TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
 
-// 1. OBTENER HORARIOS DISPONIBLES
-export async function getAvailableSlots(dateStr: string, durationMinutes = 45) {
+function getCalendarClient() {
   const auth = new google.auth.GoogleAuth({
     credentials: {
       client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -11,25 +10,28 @@ export async function getAvailableSlots(dateStr: string, durationMinutes = 45) {
     },
     scopes: ['https://www.googleapis.com/auth/calendar'],
   });
-  const calendar = google.calendar({ version: 'v3', auth });
+  return google.calendar({ version: 'v3', auth });
+}
 
+export async function getAvailableSlots(dateStr: string, durationMinutes = 45) {
+  const calendar = getCalendarClient();
   const startOfDay = new Date(`${dateStr}T09:00:00-06:00`); 
   const endOfDay = new Date(`${dateStr}T19:00:00-06:00`); 
+  const calendarId = process.env.GOOGLE_CALENDAR_ID as string;
 
   const response = await calendar.freebusy.query({
     requestBody: {
       timeMin: startOfDay.toISOString(),
       timeMax: endOfDay.toISOString(),
       timeZone: TIMEZONE,
-      items: [{ id: process.env.GOOGLE_CALENDAR_ID as string }],
+      items: [{ id: calendarId }],
     },
   });
 
-  const busySlots = response.data.calendars?.[process.env.GOOGLE_CALENDAR_ID as string]?.busy || [];
+  const busySlots = response.data.calendars?.[calendarId]?.busy || [];
   return { date: dateStr, busySlots };
 }
 
-// 2. CREAR CITA
 export async function createCalendarAppointment(params: {
   patientName: string;
   patientPhone: string;
@@ -39,15 +41,7 @@ export async function createCalendarAppointment(params: {
   clinicalSummary?: string;
   isUrgent?: boolean;
 }) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/calendar'],
-  });
-  const calendar = google.calendar({ version: 'v3', auth });
-
+  const calendar = getCalendarClient();
   const title = params.isUrgent ? `[URGENTE] Cita: ${params.patientName}` : `Cita: ${params.patientName}`;
   const description = `Teléfono: ${params.patientPhone}\nMotivo: ${params.reason || 'No especificado'}\nResumen: ${params.clinicalSummary || 'N/A'}`;
 
@@ -58,26 +52,15 @@ export async function createCalendarAppointment(params: {
       description,
       start: { dateTime: params.startTime, timeZone: TIMEZONE },
       end: { dateTime: params.endTime, timeZone: TIMEZONE },
-      extendedProperties: {
-        private: { patientPhone: params.patientPhone },
-      },
+      extendedProperties: { private: { patientPhone: params.patientPhone } },
     },
   });
 
   return { success: true, eventId: event.data.id, message: 'Cita agendada correctamente.' };
 }
 
-// 3. OBTENER TODAS LAS CITAS DE UN RANGO (Para el Admin)
 export async function getAppointmentsByDateRange(startIso: string, endIso: string) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/calendar'],
-  });
-  const calendar = google.calendar({ version: 'v3', auth });
-
+  const calendar = getCalendarClient();
   const response = await calendar.events.list({
     calendarId: process.env.GOOGLE_CALENDAR_ID as string,
     timeMin: startIso,
@@ -86,7 +69,7 @@ export async function getAppointmentsByDateRange(startIso: string, endIso: strin
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map((event: any) => ({
+  return (response.data.items || []).map((event) => ({
     eventId: event.id,
     summary: event.summary,
     start: event.start?.dateTime || event.start?.date,
@@ -95,17 +78,8 @@ export async function getAppointmentsByDateRange(startIso: string, endIso: strin
   }));
 }
 
-// 4. OBTENER CITAS DE UN PACIENTE ESPECÍFICO (Para el Paciente)
 export async function getPatientAppointments(patientPhone: string) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/calendar'],
-  });
-  const calendar = google.calendar({ version: 'v3', auth });
-  
+  const calendar = getCalendarClient();
   const timeMin = new Date().toISOString(); 
   
   const response = await calendar.events.list({
@@ -116,7 +90,7 @@ export async function getPatientAppointments(patientPhone: string) {
     orderBy: 'startTime',
   });
 
-  return (response.data.items || []).map((event: any) => ({
+  return (response.data.items || []).map((event) => ({
     eventId: event.id,
     summary: event.summary,
     start: event.start?.dateTime || event.start?.date,
@@ -124,28 +98,20 @@ export async function getPatientAppointments(patientPhone: string) {
   }));
 }
 
-// 5. CANCELAR EVENTO
 export async function cancelCalendarEvent(eventId: string) {
-  const auth = new google.auth.GoogleAuth({
-    credentials: {
-      client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    },
-    scopes: ['https://www.googleapis.com/auth/calendar'],
-  });
-  const calendar = google.calendar({ version: 'v3', auth });
-
+  const calendar = getCalendarClient();
   let patientName = '';
   let patientPhone = '';
+  
   try {
     const event = await calendar.events.get({
       calendarId: process.env.GOOGLE_CALENDAR_ID as string,
       eventId,
     });
-    patientName = event.data.summary?.replace('[URGENTE] Cita: ', '')?.replace('Cita: ', '') || '';
+    patientName = event.data.summary?.replace(/\[URGENTE\]\s*Cita:\s*/i, '')?.replace(/Cita:\s*/i, '') || '';
     patientPhone = event.data.extendedProperties?.private?.patientPhone || '';
   } catch (error) {
-    console.warn('No se pudo recuperar información del evento antes de borrarlo.', error);
+    console.warn('Advertencia: No se pudo obtener datos previos del evento.', error);
   }
 
   await calendar.events.delete({

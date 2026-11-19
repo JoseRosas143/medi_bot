@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getAppointmentsByDateRange } from '@/lib/calendar';
 import { sendWhatsAppTemplate } from '@/lib/whatsapp';
-import { supabaseAdmin as supabase } from '@/lib/supabase';
+import { supabaseAdmin } from '@/lib/supabase';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,46 +13,51 @@ export async function GET(request: Request) {
 
   try {
     const now = new Date();
-    // Buscamos citas que ocurran exactamente entre 23 y 24 horas a partir de este momento
-    const tomorrowStart = new Date(now.getTime() + 23 * 60 * 60 * 1000);
-    const tomorrowEnd = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    // Buscar citas para las próximas 24 horas (margen de 23 a 25 horas)
+    const startIso = new Date(now.getTime() + 23 * 60 * 60 * 1000).toISOString();
+    const endIso = new Date(now.getTime() + 25 * 60 * 60 * 1000).toISOString();
 
-    const appointments = await getAppointmentsByDateRange(
-      tomorrowStart.toISOString(),
-      tomorrowEnd.toISOString()
-    );
+    const appointments = await getAppointmentsByDateRange(startIso, endIso);
+    let sent = 0;
 
-    const { data: settings } = await supabase.from('bot_settings').select('bot_name').eq('id', 1).single();
-    const clinicName = settings?.bot_name || 'la clínica';
+    for (const appt of appointments) {
+      const patientPhone = appt.patientPhone;
+      if (!patientPhone) continue;
 
-    let sentCount = 0;
-
-    for (const apt of appointments) {
-      if (!apt.patientPhone) continue;
+      // Extraer el nombre del summary (ej. "Cita: José" -> "José")
+      const patientName = appt.summary?.replace(/\[URGENTE\]\s*Cita:\s*/i, '')?.replace(/Cita:\s*/i, '') || 'Paciente';
+      
+      // Formatear la fecha para que Meta la envíe amigable
+      const dateObj = new Date(appt.start as string);
+      const formattedTime = new Intl.DateTimeFormat('es-MX', {
+        timeZone: process.env.CLINIC_TIMEZONE || 'America/Mexico_City',
+        weekday: 'long',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+      }).format(dateObj);
 
       try {
         await sendWhatsAppTemplate(
-          apt.patientPhone,
-          'cita_recordatorio', // Nombre de la plantilla en Meta
-          [apt.patientName, clinicName, apt.formattedTime]
+          patientPhone,
+          'cita_recordatorio',
+          [patientName, 'nuestra clínica', formattedTime]
         );
         
-        // Guardamos el registro en el chat
-        await supabase.from('chat_messages').insert({
-          patient_phone: apt.patientPhone,
+        await supabaseAdmin.from('chat_messages').insert({
+          patient_phone: patientPhone,
           role: 'assistant',
-          content: `⏰ Recordatorio enviado para la cita de mañana a las ${apt.formattedTime}.`
+          content: `⏰ (Sistema) Recordatorio enviado automáticamente para la cita del ${formattedTime}.`
         });
-        
-        sentCount++;
+        sent++;
       } catch (err) {
-        console.error(`Error enviando recordatorio a ${apt.patientPhone}:`, err);
+        console.warn(`[Cron] No se pudo enviar recordatorio a ${patientPhone}:`, err);
       }
     }
 
-    return NextResponse.json({ success: true, reminders_sent: sentCount });
+    return NextResponse.json({ success: true, reminders_sent: sent });
   } catch (error) {
-    console.error('Cron Error:', error);
-    return NextResponse.json({ success: false, error: 'Internal Server Error' }, { status: 500 });
+    console.error('[Cron] Error interno:', error);
+    return NextResponse.json({ success: false, error: String(error) }, { status: 500 });
   }
 }
