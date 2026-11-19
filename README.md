@@ -8,7 +8,9 @@ Bot de recepción para WhatsApp. Next.js recibe mensajes de Meta, Supabase guard
 2. Configura `WHATSAPP_APP_SECRET` con el secreto de la app de Meta que firmó el webhook. Conserva el token de verificación existente. En Meta, suscribe el evento `messages` a `/api/webhook/whatsapp`.
 3. En un Supabase nuevo, aplica [el esquema base](supabase/schema.sql) seguido de [las migraciones](supabase/migrations/) en orden. En una base existente, consulta el historial antes de aplicar migraciones. El bot usa la clave de servidor. Los roles públicos no tienen acceso a estas tablas.
 4. Usa una cuenta de servicio con permiso para hacer cambios en Google Calendar. El horario de reserva predeterminado es de 09:00 a 19:00 y cada cita dura 45 minutos. Los bloqueos, cierres y días de descanso se respetan cuando están marcados como ocupados en Calendar.
-5. Despliega en Vercel y verifica que `CRON_SECRET` esté definido. Vercel Hobby ejecuta el cron una vez al día entre las 12:00 y las 12:59 de Ciudad de México. La tanda cubre todas las citas de mañana en el calendario de la clínica.
+5. Despliega en Vercel y define `CRON_SECRET` en Production. El trabajo «Recordatorios Clínica WhatsApp» en [cron-job.org](https://console.cron-job.org/) llama cada hora al endpoint `GET /api/cron/reminders` con la cabecera personalizada `Authorization: Bearer <CRON_SECRET>`. Conserva el valor en la cabecera y fuera de la URL.
+
+En condiciones normales, el recordatorio se procesa unas 23–24 horas antes de la cita. La búsqueda se amplía a 21 horas y 55 minutos para tolerar una ejecución omitida y pequeños retrasos. Supabase registra el aviso por cita y hora de inicio para evitar duplicados en las ejecuciones solapadas.
 
 Los eventos creados por Benson guardan el teléfono de WhatsApp como propiedad privada `patientPhone`. Para enviar avisos sobre eventos creados manualmente, asocia esa misma propiedad al evento con el número validado. El bot omite eventos de día completo, cancelados o sin teléfono para los avisos.
 
