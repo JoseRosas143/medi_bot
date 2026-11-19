@@ -1,0 +1,26 @@
+# Dependencias (carpetas muy pesadas que Vercel instala solo)
+/node_modules
+/.pnp
+.pnp.*
+
+# Archivos compilados de Next.js y TypeScript
+/.next/
+/out/
+/build
+*.tsbuildinfo
+next-env.d.ts
+
+# Variables de entorno y contraseñas (¡NUNCA subir a GitHub!)
+.env
+.env*.local
+!.env.example
+
+# Archivos temporales de Vercel y del sistema operativo
+.vercel
+.DS_Store
+Thumbs.db
+
+# Logs de errores
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
