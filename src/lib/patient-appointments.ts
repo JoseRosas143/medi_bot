@@ -3,6 +3,7 @@ import { proposeAppointmentAction } from '@/lib/appointment-actions';
 import { startReschedule } from '@/lib/booking';
 import { confirmCalendarAttendance, getPatientAppointments, type CalendarEventData } from '@/lib/calendar';
 import { CLINIC_TIMEZONE, formatAppointment } from '@/lib/clinic-time';
+import { formatVisitLocation } from '@/lib/clinic-visit';
 import { normalized } from '@/lib/menus';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, shorten } from '@/lib/whatsapp';
@@ -20,7 +21,7 @@ function showAppointment(phone: string, event: CalendarEventData) {
   const id = appointmentCode(event);
   return sendWhatsAppInteractiveButtons({
     to: phone,
-    bodyText: `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}`,
+    bodyText: `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}\n\n${formatVisitLocation()}`,
     buttons: [
       ...(!event.attendanceConfirmed ? [{ id: `appt_attend_${id}`, title: 'Confirmar asistencia' }] : []),
       { id: `appt_move_${id}`, title: 'Cambiar horario' },
