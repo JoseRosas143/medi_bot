@@ -1,6 +1,6 @@
 import { google, type calendar_v3 } from 'googleapis';
 import { clinicDate, clinicInstant, CLINIC_TIMEZONE, formatAppointment, nextDate } from '@/lib/clinic-time';
-import { isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp';
+import { comparableWhatsApp, isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp';
 
 const APPOINTMENT_MINUTES = 45;
 
@@ -25,6 +25,12 @@ function getCalendarClient() {
 function eventContact(event: calendar_v3.Schema$Event): string {
   const phone = phoneDigits(event.extendedProperties?.private?.patientPhone || undefined);
   return isWhatsAppPhone(phone) ? phone : '';
+}
+
+function withPatientPhone(description: string | null | undefined, phone: string) {
+  const notes = (description || '').split('\n')
+    .filter(line => !/^WhatsApp del paciente: \+?\d+\s*$/.test(line)).join('\n').trimEnd();
+  return [notes, `WhatsApp del paciente: +${phone}`].filter(Boolean).join('\n');
 }
 
 function toAppointment(event: calendar_v3.Schema$Event): CalendarEventData | null {
@@ -111,7 +117,7 @@ export async function createCalendarAppointment(params: {
       summary: `Cita: ${params.patientName}`,
       visibility: 'private',
       transparency: 'opaque',
-      description: `Motivo o tratamiento indicado por el paciente: ${params.reason}`,
+      description: withPatientPhone(`Motivo o tratamiento indicado por el paciente: ${params.reason}`, params.patientPhone),
       start: { dateTime: slot.start, timeZone: CLINIC_TIMEZONE },
       end: { dateTime: slot.end, timeZone: CLINIC_TIMEZONE },
       extendedProperties: { private: { patientPhone: params.patientPhone } },
@@ -183,6 +189,13 @@ export async function getPatientAppointments(patientPhone: string) {
   return events.filter(event => event.patientPhone === patientPhone && Date.parse(event.start) > now.getTime());
 }
 
+export async function findUpcomingAppointmentsByWhatsApp(phone: string) {
+  const canonical = comparableWhatsApp(phone);
+  const numbers = /^52\d{10}$/.test(canonical) ? [canonical, `521${canonical.slice(2)}`] : [canonical];
+  const appointments = await Promise.all(numbers.map(getPatientAppointments));
+  return appointments.flat().sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+}
+
 export function appointmentPatientName(summary: string) {
   return summary.replace(/^(\[URGENTE\]\s*)?Cita:\s*/i, '').trim() || 'Paciente';
 }
@@ -240,18 +253,37 @@ export function moveCalendarAppointment(expected: CalendarEventData, ownerPhone:
   return updatePatientAppointment(expected, ownerPhone, newStart);
 }
 
-export async function cancelCalendarEvent(expected: CalendarEventData, ownerPhone?: string) {
+export async function cancelCalendarEvent(expected: CalendarEventData, ownerPhone?: string, correctedPhone?: string) {
   const { calendar, calendarId } = getCalendarClient();
-  const response = await calendar.events.get({ calendarId, eventId: expected.eventId }, { timeout: 8_000 });
-  const current = toAppointment(response.data);
+  const eventId = expected.eventId;
+  const response = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
+  let current = toAppointment(response.data);
   if (!current || Date.parse(current.start) <= Date.now() ||
-      Date.parse(current.start) !== Date.parse(expected.start) || current.summary !== expected.summary ||
-      current.patientPhone !== expected.patientPhone || (ownerPhone && current.patientPhone !== ownerPhone)) {
+      Date.parse(current.start) !== Date.parse(expected.start) || Date.parse(current.end) !== Date.parse(expected.end) ||
+      current.summary !== expected.summary || current.patientPhone !== expected.patientPhone ||
+      (ownerPhone && current.patientPhone !== ownerPhone)) {
     return null;
   }
-  const etag = response.data.etag;
+  let etag = response.data.etag;
   if (!etag) throw new Error('Calendar no devolvió la versión de la cita');
-  await calendar.events.delete({ calendarId, eventId: expected.eventId }, {
+  if (correctedPhone) {
+    const description = withPatientPhone(response.data.description, correctedPhone);
+    await calendar.events.patch({ calendarId, eventId, sendUpdates: 'none', requestBody: {
+      visibility: 'private', description,
+      extendedProperties: { private: {
+        ...response.data.extendedProperties?.private, patientPhone: correctedPhone, attendanceConfirmedFor: 'pending',
+      } },
+    } }, { headers: { 'If-Match': etag }, timeout: 10_000 });
+    const { data: saved } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
+    current = toAppointment(saved);
+    if (!current || current.eventId !== eventId || current.summary !== expected.summary ||
+        !appointmentMatchesSlot(current, correctedPhone, expected) || saved.visibility !== 'private' ||
+        saved.description !== description || !saved.etag) {
+      throw new Error('Calendar no permitió verificar el WhatsApp corregido');
+    }
+    etag = saved.etag;
+  }
+  await calendar.events.delete({ calendarId, eventId, sendUpdates: 'none' }, {
     headers: { 'If-Match': etag }, timeout: 10_000,
   });
   return current;

@@ -1,17 +1,29 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
+import { findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
 import { clinicDate, clinicDayRange, formatAppointment } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
 import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { findCatalogEntries, normalized, showAdminMenu, type Catalog } from '@/lib/menus';
-import { sendWhatsAppText } from '@/lib/whatsapp';
+import { parseClinicWhatsApp, sendWhatsAppText } from '@/lib/whatsapp';
 
 export async function showSchedule(phone: string, date = clinicDate(), events?: CalendarEventData[]) {
   const appointments = events ?? await getAppointmentsByDateRange(...clinicDayRange(date));
   const lines = appointments.slice(0, 25).map(event => `• ${formatAppointment(event.start)} — ${event.summary}${event.patientPhone ? event.attendanceConfirmed ? ' · Asistencia confirmada' : ' · Asistencia pendiente' : ''}`);
-  await sendWhatsAppText(phone, `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}`);
+  await sendWhatsAppText(phone, `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}\n\nPara buscar por número, escribe «Buscar cita por WhatsApp» y el número completo.`);
+}
+
+export async function showAppointmentsByWhatsApp(admin: string, input: string) {
+  const phone = parseClinicWhatsApp(input);
+  if (!phone) {
+    await sendWhatsAppText(admin, 'Escribe «Buscar cita por WhatsApp» seguido del número completo. Usa 10 dígitos para México o incluye el código de país.');
+    return;
+  }
+  const appointments = await findUpcomingAppointmentsByWhatsApp(phone);
+  const lines = appointments.slice(0, 10).map(event => `• ${formatAppointment(event.start)} — ${event.summary}`);
+  const remaining = appointments.length > 10 ? `\nHay ${appointments.length - 10} citas más para este número en Calendar.` : '';
+  await sendWhatsAppText(admin, `🗓️ *Citas futuras · WhatsApp •••• ${phone.slice(-4)}*\n${lines.join('\n') || 'Sin citas futuras para ese número.'}${remaining}`);
 }
 
 const tools: ChatCompletionTool[] = [
