@@ -2,10 +2,23 @@ import { supabaseAdmin as db } from '@/lib/supabase';
 import { appointmentPatientName, type CalendarEventData } from '@/lib/calendar';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
 import { recordTaskReminderStatus } from '@/lib/clinic-tasks';
-import { sendWhatsAppTemplate, WhatsAppError } from '@/lib/whatsapp';
+import { normalized } from '@/lib/menus';
+import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, WhatsAppError } from '@/lib/whatsapp';
+
+export async function hasVerifiedCancellationContact(appointment: CalendarEventData) {
+  const phone = appointment.patientPhone;
+  const comparableNumber = (value: string) => value.replace(/^521(?=\d{10}$)/, '52');
+  if (!isWhatsAppPhone(phone) ||
+      comparableNumber(phone) === comparableNumber(phoneDigits(process.env.ADMIN_PHONE_NUMBER))) return false;
+  const { data } = await db.from('patients').select('full_name').eq('phone', phone).maybeSingle().throwOnError();
+  if (!data?.full_name) return false;
+  const comparableName = (value: string) => normalized(value).replace(/\s+/g, ' ');
+  return comparableName(data.full_name) === comparableName(appointmentPatientName(appointment.summary));
+}
 
 export async function sendAppointmentNotice(appointment: CalendarEventData, kind: 'reminder' | 'cancellation') {
   if (!appointment.patientPhone) return 'no_contact';
+  if (kind === 'cancellation' && !await hasVerifiedCancellationContact(appointment)) return 'unverified_contact';
   const name = kind === 'reminder'
     ? process.env.WHATSAPP_REMINDER_TEMPLATE
     : process.env.WHATSAPP_CANCELLATION_TEMPLATE;
