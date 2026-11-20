@@ -36,6 +36,7 @@ const notices = new Set();
 const reminderReplies = new Map();
 const saved = [];
 const bookingDrafts = new Map();
+const treatmentDrafts = new Map();
 const clinicTasks = new Map();
 let taskReminderTemplate = null;
 const createdAppointments = [];
@@ -115,7 +116,7 @@ globalThis.testCalendar = {
 };
 const treatments = Array.from({ length: 12 }, (_, i) => ({
   id: i + 1, price: 100.5 + i, name: `Tratamiento de muestra número ${i + 1}`,
-  description: 'Descripción informativa de la clínica.',
+  description: 'Descripción informativa de la clínica.', is_active: true,
 }));
 
 function query(table) {
@@ -141,7 +142,8 @@ function query(table) {
     lt: (field, value) => { constraints.push(row => row[field] != null && row[field] < value); return chain; },
     lte: (field, value) => { constraints.push(row => row[field] != null && row[field] <= value); return chain; },
     limit: value => { limit = value; return chain; },
-    match: () => chain, gt: (field, value) => { constraints.push(row => row[field] > value); return chain; }, delete: () => chain,
+    match: () => chain, gt: (field, value) => { constraints.push(row => row[field] > value); return chain; },
+    delete: () => { operation = 'delete'; return chain; },
     is: (field, value) => { filters[field] = value; return chain; },
     insert: value => { operation = 'insert'; values = value; return chain; },
     upsert: value => { operation = 'upsert'; values = value; return chain; },
@@ -186,6 +188,18 @@ function query(table) {
         }
         return resolve({ data: row || null, error: null });
       }
+      if (table === 'treatment_edit_drafts') {
+        if (operation === 'upsert') {
+          treatmentDrafts.set(values.actor_phone, { ...values });
+          return resolve({ data: null, error: null });
+        }
+        const row = treatmentDrafts.get(filters.actor_phone);
+        if (!row || !Object.entries(filters).every(([key, value]) => row[key] === value) ||
+            !constraints.every(check => check(row))) return resolve({ data: null, error: null });
+        if (operation === 'update') Object.assign(row, values);
+        if (operation === 'delete') treatmentDrafts.delete(filters.actor_phone);
+        return resolve({ data: { ...row }, error: null });
+      }
       if (table === 'pending_appointment_actions') {
         if (operation === 'insert') {
           const id = randomUUID();
@@ -222,8 +236,13 @@ function query(table) {
         } });
       }
       if (table === 'chat_messages' && operation === 'insert') saved.push(values);
-      if (table === 'treatments' && range) return resolve({ data: treatments.slice(range[0], range[1] + 1) });
-      if (table === 'treatments' && filters.id) return resolve({ data: treatments.find(item => item.id === filters.id) });
+      if (table === 'treatments') {
+        let rows = treatments.filter(row =>
+          Object.entries(filters).every(([key, value]) => row[key] === value) && constraints.every(check => check(row)));
+        if (operation === 'update') rows.forEach(row => Object.assign(row, values));
+        if (range) rows = rows.slice(range[0], range[1] + 1);
+        return resolve({ data: singleRow ? rows[0] ?? null : rows, error: null });
+      }
       return resolve({ data: null, error: null });
     },
   };
@@ -317,6 +336,59 @@ function answerButton(id, button, from = patient) {
 function lastButtons() {
   return metaRequests.at(-1).interactive.action.buttons.map(button => button.reply.id);
 }
+
+test('reception reviews a treatment description before saving and patients see the saved ficha', async () => {
+  const treatment = treatments[0];
+  const original = treatment.description;
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  try {
+    await webhook([answerButton('admin-treatment-editor', 'adm_edit_treatment', admin)]);
+    const rows = metaRequests.at(-1).interactive.action.sections.flatMap(section => section.rows);
+    assert.ok(rows.some(row => row.id === 'ted_card_1'));
+    await webhook([answerButton('admin-treatment-card', 'ted_card_1', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Descripción informativa/);
+    await webhook([answerButton('admin-treatment-fields', 'ted_fields_1', admin)]);
+    assert.ok(lastButtons().includes('ted_price_1'));
+    await webhook([answerButton('admin-treatment-description', 'ted_description_1', admin)]);
+    const promptId = `mock_${metaRequests.length}`;
+    const description = 'Incluye una revisión y una explicación del procedimiento.';
+    await webhook([{ ...textMessage('admin-description-reply', description, admin), context: { id: promptId } }]);
+    assert.equal(treatment.description, original);
+    assert.match(metaRequests.at(-1).interactive.body.text, /\*Propuesto\*/);
+    const save = lastButtons()[0];
+    await webhook([answerButton('wrong-actor-treatment-save', save, patient)]);
+    assert.equal(treatment.description, original);
+    await webhook([answerButton('confirm-treatment-description', save, admin)]);
+    assert.equal(treatment.description, description);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Cambio guardado/);
+    await webhook([answerButton('patient-reads-treatment-update', 'trt_1', patient)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Incluye una revisión/);
+  } finally {
+    treatment.description = original;
+    treatmentDrafts.clear();
+  }
+});
+
+test('reception can hide and restore a ficha without overwriting newer changes', async () => {
+  const treatment = treatments[0];
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  try {
+    await webhook([answerButton('admin-hide-treatment', 'ted_is_active_1', admin)]);
+    assert.equal(treatment.is_active, true);
+    const stale = lastButtons()[0];
+    treatment.is_active = false;
+    await webhook([answerButton('admin-confirms-stale-visibility', stale, admin)]);
+    assert.match(metaRequests.at(-1).text.body, /cambió mientras revisabas/);
+    await showCatalog(patient, 'treatments');
+    assert.equal(metaRequests.at(-1).interactive.action.sections.flatMap(section => section.rows).some(row => row.id === 'trt_1'), false);
+    await webhook([answerButton('admin-restore-treatment', 'ted_is_active_1', admin)]);
+    await webhook([answerButton('admin-confirms-restored-visibility', lastButtons()[0], admin)]);
+    assert.equal(treatment.is_active, true);
+  } finally {
+    treatment.is_active = true;
+    treatmentDrafts.clear();
+  }
+});
 
 function appointmentOptions() {
   const { action } = metaRequests.at(-1).interactive;

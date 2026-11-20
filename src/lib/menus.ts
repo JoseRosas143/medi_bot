@@ -15,7 +15,8 @@ export function formatPrice(price: number | string) {
     : 'Consulta el precio con recepción';
 }
 
-async function showList(to: string, bodyText: string, buttonText: string, sections: WhatsAppListSection[]) {
+export async function showList(to: string, bodyText: string, buttonText: string, sections: WhatsAppListSection[],
+  fallbackInstruction = 'Escribe el nombre de la opción que te interesa.') {
   try {
     await sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections });
   } catch (error) {
@@ -23,7 +24,7 @@ async function showList(to: string, bodyText: string, buttonText: string, sectio
     const sectionsText = sections.map(section =>
       `*${section.title}*\n${section.rows.map(row => `• ${row.title}${row.description ? ` — ${row.description}` : ''}`).join('\n')}`,
     ).join('\n\n');
-    await sendWhatsAppText(to, `${bodyText}\n\n${sectionsText}\n\nEscribe el nombre de la opción que te interesa.`);
+    await sendWhatsAppText(to, `${bodyText}\n\n${sectionsText}\n\n${fallbackInstruction}`);
   }
 }
 
@@ -89,8 +90,14 @@ export async function catalogDetail(catalog: Catalog, id: number): Promise<strin
   const { data } = await db.from(catalog).select('*').eq('id', id).eq('is_active', true).maybeSingle().throwOnError();
   if (!data) return null;
   return catalog === 'treatments'
-    ? `🦷 *${data.name}*\n\n*En qué consiste*\n${data.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(data.price)}`
+    ? formatTreatmentDetail(data as TreatmentCard)
     : `ℹ️ *${data.question}*\n${data.answer}`;
+}
+
+export type TreatmentCard = { name: string; price: number; description: string | null };
+
+export function formatTreatmentDetail(treatment: TreatmentCard) {
+  return `🦷 *${treatment.name}*\n\n*En qué consiste*\n${treatment.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(treatment.price)}`;
 }
 
 export async function treatmentName(id: number): Promise<string | null> {
