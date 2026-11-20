@@ -1,8 +1,8 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { cancelCalendarEvent, createCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
+import { cancelCalendarEvent, createCalendarAppointment, saveCalendarAppointmentContact, type CalendarEventData } from '@/lib/calendar';
 import { formatAppointment } from '@/lib/clinic-time';
 import { hasVerifiedCancellationContact, isPatientNoticeDestination, sendAppointmentNotice } from '@/lib/appointment-notices';
-import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText, shorten } from '@/lib/whatsapp';
+import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, shorten } from '@/lib/whatsapp';
 
 type Cancellation = {
   action: 'cancel_patient' | 'cancel_clinic';
@@ -28,18 +28,23 @@ export async function proposeAppointmentAction(phone: string, action: Cancellati
   });
   const ending = action.details.patientPhone ? ` •••• ${action.details.patientPhone.slice(-4)}` : '';
   const contact = canNotify ? `\nWhatsApp del aviso${ending}`
-    : clinic ? `\nWhatsApp${ending} sin verificar. Corrígelo si quieres enviar el aviso al paciente.` : '';
-  await sendWhatsAppInteractiveButtons({
-    to: phone,
-    bodyText: `*Confirmar cancelación*\n${actionLabel(action.details)}${contact}\n\nEsta opción vence en 15 minutos.`,
-    buttons: [
-      ...(canNotify ? [{ id: `appointment_notify_${id}`, title: 'Cancelar y avisar' }] : []),
-      ...(clinic && !canNotify ? [{ id: `appointment_contact_${id}`, title: 'Corregir WhatsApp' }] : []),
-      clinic ? { id: `appointment_only_${id}`, title: 'Solo cancelar' }
-        : { id: `appointment_yes_${id}`, title: 'Sí, cancelar cita' },
-      { id: `appointment_no_${id}`, title: 'Volver' },
-    ],
-  });
+    : clinic ? `\nWhatsApp${ending} sin verificar.` : '';
+  const title = clinic ? 'Administrar cita' : 'Confirmar cancelación';
+  const bodyText = `*${title}*\n${actionLabel(action.details)}${contact}\n\nLas opciones vencen en 15 minutos.`;
+  const options = [
+    ...(canNotify ? [{ id: `appointment_notify_${id}`, title: 'Cancelar y avisar' }] : []),
+    ...(clinic ? [{ id: `appointment_contact_${id}`, title: 'Corregir WhatsApp' }] : []),
+    clinic ? { id: `appointment_only_${id}`, title: 'Solo cancelar' }
+      : { id: `appointment_yes_${id}`, title: 'Sí, cancelar cita' },
+    { id: `appointment_no_${id}`, title: 'Volver' },
+  ];
+  if (canNotify) {
+    await sendWhatsAppInteractiveList({
+      to: phone, bodyText, buttonText: 'Ver opciones', sections: [{ title: 'Esta cita', rows: options }],
+    });
+  } else {
+    await sendWhatsAppInteractiveButtons({ to: phone, bodyText, buttons: options });
+  }
 }
 
 async function promptForCorrection(phone: string, action: Cancellation) {
@@ -74,8 +79,9 @@ export async function handleCancellationContactReply(phone: string, promptId: st
   });
   await sendWhatsAppInteractiveButtons({
     to: phone,
-    bodyText: `*Confirma el WhatsApp del paciente*\n${actionLabel(action.details)}\nNuevo número +${correctedPhone}\n\nSi corresponde al paciente, confirma para guardar el número, cancelar la cita y enviarle el aviso.`,
+    bodyText: `*Confirma el WhatsApp del paciente*\n${actionLabel(action.details)}\nNuevo número +${correctedPhone}\n\nPuedes guardar solo el número o usarlo para cancelar la cita y enviar el aviso.`,
     buttons: [
+      { id: `appointment_save_${id}`, title: 'Guardar solo número' },
       { id: `appointment_corrected_${id}`, title: 'Cancelar y avisar' },
       { id: `appointment_no_${id}`, title: 'Volver' },
     ],
@@ -111,11 +117,11 @@ export function bookWithLock(booking: Parameters<typeof createCalendarAppointmen
 }
 
 export async function handleAppointmentAction(phone: string, optionId: string | undefined, isAdmin: boolean) {
-  const match = optionId?.match(/^appointment_(yes|notify|only|contact|corrected|no)_([\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12})$/);
+  const match = optionId?.match(/^appointment_(yes|notify|only|contact|save|corrected|no)_([\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12})$/);
   if (!match) return false;
   const [, choice, id] = match;
   if (isAdmin ? choice === 'yes' : choice !== 'yes' && choice !== 'no') {
-    await sendWhatsAppText(phone, 'Esa opción cambió. Busca la cita de nuevo para confirmar la cancelación.');
+    await sendWhatsAppText(phone, 'Esa opción cambió. Busca la cita de nuevo para ver las acciones disponibles.');
     return true;
   }
 
@@ -136,13 +142,21 @@ export async function handleAppointmentAction(phone: string, optionId: string | 
   let reply = '';
   const action = data as Cancellation;
   const { correctedPhone, contactPromptId } = action.details;
-  if (contactPromptId || (choice === 'corrected') !== Boolean(correctedPhone) ||
+  const needsCorrectedPhone = choice === 'save' || choice === 'corrected';
+  if (contactPromptId || needsCorrectedPhone !== Boolean(correctedPhone) ||
       (correctedPhone && !isPatientNoticeDestination(correctedPhone))) {
-    await sendWhatsAppText(phone, 'Esa opción cambió. Busca la cita de nuevo para confirmar la cancelación.');
+    await sendWhatsAppText(phone, 'Esa opción cambió. Busca la cita de nuevo para ver las acciones disponibles.');
     return true;
   }
   if (choice === 'contact') {
     await promptForCorrection(phone, action);
+    return true;
+  }
+  if (choice === 'save' && correctedPhone) {
+    const updated = await saveCalendarAppointmentContact(action.details, correctedPhone);
+    await sendWhatsAppText(phone, updated
+      ? `✅ *WhatsApp actualizado en Calendar*\n${actionLabel(updated)}\nLa cita sigue programada para ese horario.`
+      : 'La cita cambió o ya pasó. Busca la cita de nuevo para actualizar el WhatsApp.');
     return true;
   }
   if (choice === 'notify' && !action.details.noticeAllowed) {

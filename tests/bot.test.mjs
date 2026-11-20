@@ -8,7 +8,8 @@ const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogl
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
     cancelCalendarEvent, getPatientAppointments, findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, appointmentPatientName,
-    getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot } = globalThis.testCalendar;
+    getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot,
+    saveCalendarAppointmentContact } = globalThis.testCalendar;
 `);
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -106,6 +107,7 @@ globalThis.testCalendar = {
   getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
   cancelCalendarEvent: liveCalendar.cancelCalendarEvent,
+  saveCalendarAppointmentContact: liveCalendar.saveCalendarAppointmentContact,
   appointmentMatchesSlot: liveCalendar.appointmentMatchesSlot,
   moveCalendarAppointment: liveCalendar.moveCalendarAppointment,
   confirmCalendarAttendance: liveCalendar.confirmCalendarAttendance,
@@ -316,6 +318,11 @@ function lastButtons() {
   return metaRequests.at(-1).interactive.action.buttons.map(button => button.reply.id);
 }
 
+function appointmentOptions() {
+  const { action } = metaRequests.at(-1).interactive;
+  return action.sections ? action.sections.flatMap(section => section.rows.map(row => row.id)) : lastButtons();
+}
+
 function seedPatientAppointment() {
   const event = {
     id: 'calendar-existing-event',
@@ -369,7 +376,7 @@ test('admin cancellation sends one notice to the displayed number when the patie
     const confirmation = metaRequests.at(-1).interactive.body.text;
     assert.match(confirmation, /WhatsApp del aviso •••• 0002/);
     assert.equal(confirmation.includes(patient), false);
-    const notify = lastButtons().find(id => id.startsWith('appointment_notify_'));
+    const notify = appointmentOptions().find(id => id.startsWith('appointment_notify_'));
     await webhook([answerButton('cancel-and-notify', notify, admin), answerButton('cancel-and-notify-again', notify, admin)]);
     assert.equal(events.has(event.id), false);
     const templates = metaRequests.slice(before).filter(message => message.type === 'template');
@@ -390,7 +397,7 @@ test('admin cancellation checks the recipient again after the confirmation was o
   try {
     const details = await liveCalendar.getCalendarAppointment(event.id);
     await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
-    const notify = lastButtons().find(id => id.startsWith('appointment_notify_'));
+    const notify = appointmentOptions().find(id => id.startsWith('appointment_notify_'));
     patientNames.set(patient, 'Otro Paciente');
     await webhook([answerButton('cancel-after-contact-changed', notify, admin)]);
     assert.equal(events.has(event.id), false);
@@ -457,6 +464,51 @@ test('admin can look up upcoming appointments using either WhatsApp format for M
     await webhook([textMessage('lookup-other-number', 'Buscar cita por WhatsApp +52 55 0000 0003', admin)]);
     assert.match(metaRequests.at(-1).text.body, /Sin citas futuras/);
   } finally {
+    events.clear();
+  }
+});
+
+test('admin can save a corrected WhatsApp on a verified appointment without cancelling or sending a notice', async () => {
+  const event = seedPatientAppointment();
+  event.extendedProperties.private.attendanceConfirmedFor = event.start.dateTime;
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const newPhone = '522210000033';
+  const before = metaRequests.length;
+  const patches = calendarPatches.length;
+  process.env.WHATSAPP_CANCELLATION_TEMPLATE = 'cita_cancelada_clinica';
+  try {
+    const details = await liveCalendar.getCalendarAppointment(event.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
+    const contact = appointmentOptions().find(id => id.startsWith('appointment_contact_'));
+    await webhook([{
+      id: 'open-contact-editor', from: admin, type: 'interactive',
+      interactive: { list_reply: { id: contact } },
+    }]);
+    const promptId = `mock_${metaRequests.length}`;
+    await webhook([{ ...textMessage('enter-new-phone', newPhone, admin), context: { id: promptId } }]);
+    const [save, cancel] = ['save', 'corrected'].map(action =>
+      lastButtons().find(id => id.startsWith(`appointment_${action}_`)));
+    await webhook([answerButton('patient-cannot-save-phone', save)]);
+    assert.equal(calendarPatches.length, patches);
+    await webhook([answerButton('admin-save-only', save, admin)]);
+    assert.match(metaRequests.at(-1).text.body, /WhatsApp actualizado en Calendar/);
+    await webhook([answerButton('do-not-reuse-cancel-after-save', cancel, admin)]);
+    const savedEvent = events.get(event.id);
+    assert.equal(calendarPatches.length, patches + 1);
+    assert.equal(savedEvent.id, event.id);
+    assert.deepEqual(savedEvent.start, event.start);
+    assert.deepEqual(savedEvent.end, event.end);
+    assert.equal(savedEvent.visibility, 'private');
+    assert.equal(savedEvent.description, `Motivo original\nWhatsApp del paciente: +${newPhone}`);
+    assert.equal(savedEvent.extendedProperties.private.patientPhone, newPhone);
+    assert.equal(savedEvent.extendedProperties.private.attendanceConfirmedFor, 'pending');
+    assert.equal((await liveCalendar.getPatientAppointments(newPhone))[0].eventId, event.id);
+    assert.equal((await liveCalendar.getPatientAppointments(patient)).length, 0);
+    assert.equal(metaRequests.slice(before).some(payload => payload.type === 'template'), false);
+  } finally {
+    delete process.env.WHATSAPP_CANCELLATION_TEMPLATE;
+    pendingAppointmentActions.clear();
+    notices.clear();
     events.clear();
   }
 });
