@@ -39,12 +39,23 @@ function toAppointment(event: calendar_v3.Schema$Event): CalendarEventData | nul
 
 async function getBusySlots(start: string, end: string) {
   const { calendar, calendarId } = getCalendarClient();
-  const response = await calendar.freebusy.query({
-    requestBody: { timeMin: start, timeMax: end, timeZone: CLINIC_TIMEZONE, items: [{ id: calendarId }] },
-  }, { timeout: 8_000 });
+  const [response, events] = await Promise.all([
+    calendar.freebusy.query({
+      requestBody: { timeMin: start, timeMax: end, timeZone: CLINIC_TIMEZONE, items: [{ id: calendarId }] },
+    }, { timeout: 8_000 }),
+    listCalendarEvents({
+      timeMin: start, timeMax: end, eventTypes: ['default'],
+      fields: 'nextPageToken,items(start/dateTime,end/dateTime,status,transparency,extendedProperties/private)',
+    }),
+  ]);
   const result = response.data.calendars?.[calendarId];
   if (!result || result.errors?.length) throw new Error('No se pudo verificar disponibilidad en Calendar');
-  return result.busy || [];
+  const busy = [...(result.busy || [])];
+  for (const event of events) {
+    if (event.status === 'cancelled' || (event.transparency === 'transparent' && !eventContact(event))) continue;
+    if (event.start?.dateTime && event.end?.dateTime) busy.push({ start: event.start.dateTime, end: event.end.dateTime });
+  }
+  return busy;
 }
 
 function workingHours(date: string) {
@@ -92,19 +103,21 @@ export async function createCalendarAppointment(params: {
   const availability = await getAvailableSlots(clinicDate(start));
   const slot = availability.slots.find(item => item.start === start.toISOString());
   if (!slot) return null;
-  const event = await calendar.events.insert({
+  const eventId = params.actionId.replaceAll('-', '');
+  await calendar.events.insert({
     calendarId,
     requestBody: {
-      id: params.actionId.replaceAll('-', ''),
+      id: eventId,
       summary: `Cita: ${params.patientName}`,
       visibility: 'private',
+      transparency: 'opaque',
       description: `Motivo o tratamiento indicado por el paciente: ${params.reason}`,
       start: { dateTime: slot.start, timeZone: CLINIC_TIMEZONE },
       end: { dateTime: slot.end, timeZone: CLINIC_TIMEZONE },
       extendedProperties: { private: { patientPhone: params.patientPhone } },
     },
   }, { timeout: 10_000 });
-  if (!event.data.id) throw new Error('Calendar no devolvió el identificador de la cita');
+  await verifySavedAppointment(eventId, params.patientPhone, slot);
   return slot;
 }
 
@@ -127,22 +140,37 @@ export async function getCalendarAppointment(eventId: string) {
   }
 }
 
-async function listAppointments(options: calendar_v3.Params$Resource$Events$List): Promise<CalendarEventData[]> {
+export function appointmentMatchesSlot(event: CalendarEventData | null, patientPhone: string | undefined, slot: { start: string; end: string } | undefined) {
+  return Boolean(event && patientPhone && slot && event.patientPhone === patientPhone &&
+    Date.parse(event.start) === Date.parse(slot.start) && Date.parse(event.end) === Date.parse(slot.end));
+}
+
+async function verifySavedAppointment(eventId: string, patientPhone: string, slot: { start: string; end: string }, attendanceConfirmed = false) {
+  const saved = await getCalendarAppointment(eventId);
+  if (saved?.eventId !== eventId || !appointmentMatchesSlot(saved, patientPhone, slot) ||
+      saved.attendanceConfirmed !== attendanceConfirmed) {
+    throw new Error('No se pudo verificar la cita guardada en Calendar');
+  }
+}
+
+async function listCalendarEvents(options: calendar_v3.Params$Resource$Events$List) {
   const { calendar, calendarId } = getCalendarClient();
-  const appointments: CalendarEventData[] = [];
+  const events: calendar_v3.Schema$Event[] = [];
   let pageToken: string | undefined;
   do {
     const response = await calendar.events.list({
       ...options, calendarId, pageToken, maxResults: 250, singleEvents: true,
       showDeleted: false, orderBy: 'startTime', timeZone: CLINIC_TIMEZONE,
     }, { timeout: 8_000 });
-    for (const event of response.data.items || []) {
-      const appointment = toAppointment(event);
-      if (appointment) appointments.push(appointment);
-    }
+    events.push(...(response.data.items || []));
     pageToken = response.data.nextPageToken ?? undefined;
   } while (pageToken);
-  return appointments;
+  return events;
+}
+
+async function listAppointments(options: calendar_v3.Params$Resource$Events$List): Promise<CalendarEventData[]> {
+  const events = await listCalendarEvents(options);
+  return events.map(toAppointment).filter(appointment => appointment !== null);
 }
 
 export function getAppointmentsByDateRange(startIso: string, endIso: string) {
@@ -169,13 +197,13 @@ async function updatePatientAppointment(
   try {
     const { data } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
     const current = toAppointment(data);
-    if (!current || !data.etag || current.patientPhone !== ownerPhone || !ownerPhone ||
-        Date.parse(current.start) <= Date.now() || Date.parse(current.start) !== Date.parse(expected.start)) {
+    if (!current || !data.etag || !appointmentMatchesSlot(current, ownerPhone, expected) ||
+        Date.parse(current.start) <= Date.now()) {
       return { state: 'changed' } as const;
     }
     if (!newStart && current.attendanceConfirmed) return { state: 'confirmed', label: formatAppointment(current.start) } as const;
 
-    let target = current.start;
+    let target = { start: current.start, end: current.end };
     const requestBody: calendar_v3.Schema$Event = {};
     if (newStart) {
       const date = new Date(newStart);
@@ -184,9 +212,10 @@ async function updatePatientAppointment(
       const availability = await getAvailableSlots(clinicDate(date), duration);
       const slot = availability.slots.find(item => item.start === date.toISOString());
       if (!slot || Date.parse(slot.start) === Date.parse(current.start)) return { state: 'unavailable' } as const;
-      target = slot.start;
+      target = slot;
       requestBody.start = { dateTime: slot.start, timeZone: CLINIC_TIMEZONE };
       requestBody.end = { dateTime: slot.end, timeZone: CLINIC_TIMEZONE };
+      requestBody.transparency = 'opaque';
     }
     requestBody.extendedProperties = { private: {
       ...data.extendedProperties?.private,
@@ -195,7 +224,8 @@ async function updatePatientAppointment(
     await calendar.events.patch({ calendarId, eventId, requestBody, sendUpdates: 'none' }, {
       headers: { 'If-Match': data.etag }, timeout: 10_000,
     });
-    return { state: 'confirmed', label: formatAppointment(target) } as const;
+    await verifySavedAppointment(eventId, ownerPhone, target, !newStart);
+    return { state: 'confirmed', label: formatAppointment(target.start) } as const;
   } catch (error) {
     if ([404, 410, 412].includes(calendarErrorCode(error))) return { state: 'changed' } as const;
     throw error;
