@@ -38,6 +38,15 @@ export function clinicDayRange(date: string): [string, string] {
   return [clinicInstant(date, '00:00').toISOString(), clinicInstant(nextDate(date), '00:00').toISOString()];
 }
 
+export function reminderWindow(now: Date = new Date()) {
+  const minute = 60 * 1000;
+  // Allow one missed hourly run and a few minutes of variation in its start time.
+  return {
+    start: new Date(now.getTime() + (22 * 60 - 5) * minute),
+    end: new Date(now.getTime() + 24 * 60 * minute),
+  };
+}
+
 export function formatAppointment(start: string): string {
   return new Intl.DateTimeFormat('es-MX', {
     timeZone: CLINIC_TIMEZONE, dateStyle: 'full', timeStyle: 'short',

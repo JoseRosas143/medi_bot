@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { getAppointmentsByDateRange } from '@/lib/calendar';
-import { clinicDate, clinicDayRange, nextDate } from '@/lib/clinic-time';
+import { reminderWindow } from '@/lib/clinic-time';
 import { sendAppointmentNotice } from '@/lib/appointment-notices';
 
 export const dynamic = 'force-dynamic';
@@ -16,10 +16,14 @@ export async function GET(request: Request) {
   }
 
   try {
-    const date = nextDate(clinicDate());
-    const [start, end] = clinicDayRange(date);
-    const appointments = (await getAppointmentsByDateRange(start, end))
-      .filter(event => Date.parse(event.start) >= Date.parse(start) && Date.parse(event.start) < Date.parse(end));
+    const { start, end } = reminderWindow();
+    // Calendar's timeMax excludes matching start times and ignores milliseconds.
+    const queryEnd = new Date(end.getTime() + 1000);
+    const appointments = (await getAppointmentsByDateRange(start.toISOString(), queryEnd.toISOString()))
+      .filter(event => {
+        const beginsAt = Date.parse(event.start);
+        return beginsAt >= start.getTime() && beginsAt <= end.getTime();
+      });
     const counts: Record<string, number> = {};
     for (let index = 0; index < appointments.length; index += 5) {
       const results = await Promise.allSettled(appointments.slice(index, index + 5).map(event => sendAppointmentNotice(event, 'reminder')));
@@ -29,7 +33,9 @@ export async function GET(request: Request) {
       }
     }
     const success = !counts.rejected && !counts.uncertain && !counts.error && !counts.not_configured;
-    return NextResponse.json({ success, date, counts }, { status: success ? 200 : 502 });
+    return NextResponse.json({
+      success, window_start: start.toISOString(), window_end: end.toISOString(), counts,
+    }, { status: success ? 200 : 502 });
   } catch {
     console.error('Reminder run failed before processing notices');
     return NextResponse.json({ success: false }, { status: 500 });

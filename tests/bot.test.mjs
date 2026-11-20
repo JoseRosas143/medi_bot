@@ -73,7 +73,7 @@ globalThis.fetch = async (url, options) => {
 
 const { POST: whatsapp } = await import('../src/app/api/webhook/whatsapp/route.ts');
 const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts');
-const { clinicDayRange, nextDate } = await import('../src/lib/clinic-time.ts');
+const { clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
 const { transcribeWhatsAppAudio } = await import('../src/lib/audio.ts');
@@ -146,6 +146,15 @@ test('tomorrow spans the entire local day across a month boundary', () => {
   const day = nextDate('2026-11-30');
   assert.equal(day, '2026-12-01');
   assert.deepEqual(clinicDayRange(day), ['2026-12-01T06:00:00.000Z', '2026-12-02T06:00:00.000Z']);
+});
+
+test('hourly reminder runs have enough overlap for a missed run and a small delay', () => {
+  const first = reminderWindow(new Date('2026-11-30T23:00:13Z'));
+  const second = reminderWindow(new Date('2026-12-01T00:00:13Z'));
+  assert.equal(first.start.toISOString(), '2026-12-01T20:55:13.000Z');
+  assert.equal(first.end.toISOString(), '2026-12-01T23:00:13.000Z');
+  assert.equal(second.start.toISOString(), '2026-12-01T21:55:13.000Z');
+  assert.equal(second.end.toISOString(), '2026-12-02T00:00:13.000Z');
 });
 
 test('reminders remain disabled until configured and send once per appointment time', async () => {
