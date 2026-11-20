@@ -3,10 +3,11 @@ import { supabaseAdmin as db } from '@/lib/supabase';
 import { getPatientAppointments } from '@/lib/calendar';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
 import { handleAppointmentAction } from '@/lib/appointment-actions';
+import { handleBooking, startBooking } from '@/lib/booking';
 import { runAdminAgent, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
-import { botName, catalogDetail, normalized, showAdminMenu, showCatalog, showPatientMenu } from '@/lib/menus';
-import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
+import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
+import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 export type IncomingMessage = {
   from: string;
@@ -118,8 +119,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
       .eq('phone', from).eq('chat_mode', 'AI_ACTIVE').select('phone').maybeSingle().throwOnError();
     if (!data) return;
     const session = { ...patient, human_session_id: sessionId };
-    const notified = await notifyDoctor(session, optionId === 'urgencia' || text === 'atencion prioritaria'
-      ? 'Solicitó atención prioritaria.' : 'Solicitó hablar con el equipo.').catch(async error => {
+    const notified = await notifyDoctor(session, 'Solicitó hablar con el equipo.').catch(async error => {
       await closeHumanChat(session);
       throw error;
     });
@@ -133,20 +133,34 @@ export async function handlePatientMessage(message: IncomingMessage) {
   }
 
   const fullName = patient.full_name?.trim();
+  const treatmentOption = optionId?.match(/^book_trt_(\d{1,9})$/);
+  if (treatmentOption) {
+    const treatment = await treatmentName(Number(treatmentOption[1]));
+    if (treatment) await startBooking(from, false, fullName, treatment);
+    else await reply('El tratamiento salió del catálogo. Puedes elegir otro o agendar una valoración.');
+    return;
+  }
+  if (optionId === 'agendar' || (!optionId && /^(?:(?:quiero|deseo|necesito) )?(?:agendar|reservar|hacer|sacar) (?:una )?cita$/.test(text))) {
+    return startBooking(from, false, fullName);
+  }
+  const menuNavigation = !optionId && (menuRequests.has(text) || text === 'mis citas' ||
+    ['tratamientos', 'tratamientos y precios', 'tratamientos/precios', 'preguntas frecuentes', 'info y politicas'].includes(text));
+  if (!menuNavigation && await handleBooking(from, optionId, content)) return;
   if (!fullName) {
-    const name = !optionId && (!inserted || /^(?:soy|me llamo|mi nombre es)\s/.test(text)) ? parseName(content) : null;
+    if (optionId) return;
+    const name = !inserted || /^(?:soy|me llamo|mi nombre es)\s/.test(text) ? parseName(content) : null;
     if (!name) {
-      await reply(`Hola, soy *${botName()}*, de *${clinicName()}*. ¿Cómo te llamas?`);
+      await reply(inserted ? `Hola, soy *${botName()}*, de *${clinicName()}*. ¿Cómo te llamas?` : '¿Cómo te llamas?');
       return;
     }
     let update = db.from('patients').update({ full_name: name, onboarding_completed: true }).eq('phone', from);
     update = patient.full_name === null ? update.is('full_name', null) : update.eq('full_name', patient.full_name);
     const { data } = await update.select('full_name').maybeSingle().throwOnError();
-    if (data) await showPatientMenu(from, name.split(/\s+/)[0]);
+    if (data) await showPatientMenu(from);
     return;
   }
   if (await handleAppointmentAction(from, optionId, false)) return;
-  if (optionId === 'menu_principal' || (!optionId && menuRequests.has(text))) return showPatientMenu(from, fullName.split(/\s+/)[0]);
+  if (optionId === 'menu_principal' || (!optionId && menuRequests.has(text))) return showPatientMenu(from);
   if (optionId === 'menu_tratamientos' || ['tratamientos', 'tratamientos y precios', 'tratamientos/precios'].includes(text)) return showCatalog(from, 'treatments');
   if (optionId === 'menu_faqs' || ['preguntas frecuentes', 'info y politicas'].includes(text)) return showCatalog(from, 'faqs');
   const catalogOption = optionId?.match(/^(trt|faq)_(page_)?(\d{1,9})$/);
@@ -156,24 +170,9 @@ export async function handlePatientMessage(message: IncomingMessage) {
     if (catalogOption[2]) await showCatalog(from, catalog, id);
     else {
       const detail = await catalogDetail(catalog, id) || 'Esta opción ya no está disponible.';
-      if (detail.length > 1024) {
-        await reply(detail);
-        await showCatalog(from, catalog);
-        return;
-      }
-      await sendWhatsAppInteractiveButtons({
-        to: from, bodyText: detail, buttons: [
-          { id: catalog === 'treatments' ? 'menu_tratamientos' : 'menu_faqs', title: 'Volver al listado' },
-          { id: 'menu_principal', title: 'Menú principal' },
-        ],
-      });
+      await sendCatalogDetail(from, catalog, id, detail);
       await history(from, 'assistant', detail);
     }
-    return;
-  }
-  if (optionId === 'agendar' || text === 'agendar cita') {
-    await history(from, 'user', 'Quiero agendar una cita.');
-    await reply('¿Qué día y a qué hora te gustaría venir? Por ejemplo, «mañana a las 4 p. m.».');
     return;
   }
   if (optionId === 'cancelar' || text === 'mis citas') {
@@ -182,17 +181,17 @@ export async function handlePatientMessage(message: IncomingMessage) {
     await reply(events.length ? `🗓️ *Tus próximas citas*\n${events.map(event => `• ${formatAppointment(event.start)}`).join('\n')}\n\nSi quieres cancelar, dime cuál.` : 'No encontré citas futuras asociadas a tu WhatsApp.');
     return;
   }
-  if (optionId) return showPatientMenu(from);
+  if (optionId) return;
   await history(from, 'user', content);
-  await runPatientAgent(from, fullName, reply);
+  await runPatientAgent(from, fullName, content, reply);
 }
 
 const adminPrompts: Record<string, string> = {
   admin_cancelar: 'Dime la fecha y el nombre o la hora. Por ejemplo, «Cancela la cita de Ana de mañana a las 4 p. m.».',
   admin_task: 'Escribe «Anota como pendiente» y lo que hay que hacer.',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
-  adm_add_treatment: 'Dime el nombre y el precio en MXN. Por ejemplo, «Agrega Limpieza por 500 pesos».',
-  adm_edit_treatment: 'Escribe «Actualiza Limpieza a 550 pesos» o «Retira Limpieza», según el cambio.',
+  adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',
+  adm_edit_treatment: 'Indica el tratamiento y qué quieres cambiar: descripción, precio, nombre o visibilidad.',
   adm_add_faq: 'Escribe la pregunta y su respuesta en el mismo mensaje.',
   adm_edit_faq: 'Escribe la pregunta y la nueva respuesta, o indica que quieres retirarla.',
 };
@@ -236,12 +235,16 @@ export async function handleAdminMessage(message: IncomingMessage) {
     }
   }
   if (await handleAppointmentAction(from, optionId, true)) return;
+  if (optionId === 'admin_booking' || (!optionId && ['crear cita', 'agendar cita', 'reservar cita'].includes(text))) {
+    return startBooking(from, true);
+  }
   if (!optionId && menuRequests.has(text)) return showAdminMenu(from);
   if (optionId === 'admin_agenda' || text === 'agenda de hoy') return showSchedule(from);
   if (optionId && Object.hasOwn(adminPrompts, optionId)) {
     await sendWhatsAppText(from, adminPrompts[optionId]);
     return;
   }
-  if (optionId) return showAdminMenu(from);
+  if (await handleBooking(from, optionId, content)) return;
+  if (optionId) return;
   await runAdminAgent(from, content);
 }

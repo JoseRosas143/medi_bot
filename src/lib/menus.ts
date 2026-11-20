@@ -1,6 +1,6 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicName } from '@/lib/clinic-time';
-import { sendWhatsAppInteractiveList, sendWhatsAppText, WhatsAppError, type WhatsAppListSection } from '@/lib/whatsapp';
+import { sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, WhatsAppError, type WhatsAppListSection } from '@/lib/whatsapp';
 
 export const botName = () => process.env.CLINIC_BOT_NAME || 'Benson';
 
@@ -27,13 +27,11 @@ async function showList(to: string, bodyText: string, buttonText: string, sectio
   }
 }
 
-export function showPatientMenu(to: string, firstName?: string) {
-  const intro = firstName ? `Hola, ${firstName}. Soy ${botName()}, de ${clinicName()}.` : `Soy ${botName()}, de ${clinicName()}.`;
-  return showList(to, `🦷 *${clinicName()}*\n${intro}\n\nElige una opción o escríbeme lo que necesitas.`, 'Ver opciones', [
+export function showPatientMenu(to: string) {
+  return showList(to, `🦷 *${clinicName()}*\nElige una opción o escríbeme lo que necesitas.`, 'Ver opciones', [
     { title: 'Tu cita', rows: [
       { id: 'agendar', title: 'Agendar cita', description: 'Consulta horarios y reserva' },
       { id: 'cancelar', title: 'Mis citas', description: 'Consulta o cancela una cita' },
-      { id: 'urgencia', title: 'Atención prioritaria', description: 'Solicita apoyo de la clínica' },
     ] },
     { title: 'La clínica', rows: [
       { id: 'menu_tratamientos', title: 'Tratamientos y precios', description: 'Explora los precios registrados' },
@@ -47,13 +45,14 @@ export function showAdminMenu(to: string) {
   return showList(to, `🦷 *${clinicName()} · Administración*\nElige una tarea o escribe lo que necesitas hacer.`, 'Abrir panel', [
     { title: 'Agenda y clínica', rows: [
       { id: 'admin_agenda', title: 'Agenda de hoy' },
+      { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
       { id: 'admin_cancelar', title: 'Cancelar cita' },
       { id: 'admin_task', title: 'Anotar pendiente' },
       { id: 'admin_cerrar_chat', title: 'Cerrar chat directo' },
     ] },
     { title: 'Catálogo', rows: [
       { id: 'adm_add_treatment', title: 'Agregar tratamiento' },
-      { id: 'adm_edit_treatment', title: 'Editar tratamiento', description: 'Actualiza el precio o retíralo del menú' },
+      { id: 'adm_edit_treatment', title: 'Editar tratamiento', description: 'Actualiza la descripción, el precio o la visibilidad' },
       { id: 'adm_add_faq', title: 'Agregar pregunta' },
       { id: 'adm_edit_faq', title: 'Editar pregunta', description: 'Actualiza la respuesta o retira la pregunta' },
     ] },
@@ -89,8 +88,26 @@ export async function catalogDetail(catalog: Catalog, id: number): Promise<strin
   const { data } = await db.from(catalog).select('*').eq('id', id).eq('is_active', true).maybeSingle().throwOnError();
   if (!data) return null;
   return catalog === 'treatments'
-    ? `🦷 *${data.name}*\nPrecio registrado: ${formatPrice(data.price)}.\n\nPara reservar, escribe «agendar cita».`
+    ? `🦷 *${data.name}*\n\n*En qué consiste*\n${data.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(data.price)}`
     : `ℹ️ *${data.question}*\n${data.answer}`;
+}
+
+export async function treatmentName(id: number): Promise<string | null> {
+  const { data } = await db.from('treatments').select('name').eq('id', id).eq('is_active', true).maybeSingle().throwOnError();
+  return data?.name ?? null;
+}
+
+export async function sendCatalogDetail(to: string, catalog: Catalog, id: number, detail: string) {
+  const buttons = [
+    ...(catalog === 'treatments' ? [{ id: `book_trt_${id}`, title: 'Agendar cita' }] : []),
+    { id: catalog === 'treatments' ? 'menu_tratamientos' : 'menu_faqs', title: 'Volver al listado' },
+    { id: 'menu_principal', title: 'Menú principal' },
+  ];
+  if (detail.length <= 1024) {
+    return sendWhatsAppInteractiveButtons({ to, bodyText: detail, buttons });
+  }
+  await sendWhatsAppText(to, detail);
+  return sendWhatsAppInteractiveButtons({ to, bodyText: 'Puedes continuar con estas opciones.', buttons });
 }
 
 export async function findCatalogEntries(catalog: Catalog, term: string) {

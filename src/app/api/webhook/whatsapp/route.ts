@@ -18,7 +18,7 @@ type WhatsAppMessage = {
 type WhatsAppPayload = {
   object?: string;
   entry?: Array<{ changes?: Array<{ field?: string; value?: {
-    metadata?: { phone_number_id?: string }; messages?: WhatsAppMessage[];
+    metadata?: { phone_number_id?: string; display_phone_number?: string }; messages?: WhatsAppMessage[];
     statuses?: Array<{ id: string; status: string }>;
   } }> }>;
 };
@@ -38,8 +38,12 @@ function validSignature(body: Buffer, signature: string | null, secret: string) 
   return timingSafeEqual(Buffer.from(signature.slice(7), 'hex'), createHmac('sha256', secret).update(body).digest());
 }
 
-async function processMessage(message: WhatsAppMessage) {
+async function processMessage(message: WhatsAppMessage, displayNumber?: string) {
   if (!message.id || !isWhatsAppPhone(message.from)) return;
+  const normalizedNumber = (number: string | undefined) => phoneDigits(number).replace(/^521(?=\d{10}$)/, '52');
+  if (normalizedNumber(message.from) === normalizedNumber(displayNumber)) return;
+  const sentAt = Number(message.timestamp) * 1000;
+  if (Number.isFinite(sentAt) && sentAt > 0 && Date.now() - sentAt >= 86_400_000) return;
   const reply = message.interactive?.list_reply || message.interactive?.button_reply;
   const text = message.type === 'text' ? message.text?.body : message.type === 'interactive' ? reply?.title : undefined;
   const mediaId = message.type === 'audio' ? message.audio?.id : undefined;
@@ -95,7 +99,7 @@ export async function POST(request: Request) {
         const value = change.value;
         if (change.field !== 'messages' || value?.metadata?.phone_number_id !== process.env.WHATSAPP_PHONE_NUMBER_ID) continue;
         for (const status of value.statuses || []) await recordNoticeStatus(status.id, status.status);
-        for (const message of value.messages || []) await processMessage(message);
+        for (const message of value.messages || []) await processMessage(message, value.metadata.display_phone_number);
       }
     }
     return NextResponse.json({ status: 'ok' });
