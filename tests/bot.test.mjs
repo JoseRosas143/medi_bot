@@ -4,14 +4,17 @@ import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 
 const databaseUrl = 'data:text/javascript,export const supabaseAdmin=globalThis.testDatabase';
+const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogle';
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
-    cancelCalendarEvent, getPatientAppointments, getAppointmentsByDateRange, appointmentPatientName } = globalThis.testCalendar;
+    cancelCalendarEvent, getPatientAppointments, getAppointmentsByDateRange, appointmentPatientName,
+    getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance } = globalThis.testCalendar;
 `);
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier === '@/lib/supabase') return { shortCircuit: true, url: databaseUrl };
     if (specifier === '@/lib/calendar') return { shortCircuit: true, url: calendarUrl };
+    if (specifier === 'googleapis') return { shortCircuit: true, url: googleUrl };
     if (specifier.startsWith('@/')) {
       return nextResolve(new URL(`../src/${specifier.slice(2)}.ts`, import.meta.url).href, context);
     }
@@ -29,12 +32,45 @@ process.env.CLINIC_TIMEZONE = 'America/Mexico_City';
 const metaRequests = [];
 const receipts = new Set();
 const notices = new Set();
+const reminderReplies = new Map();
 const saved = [];
 const bookingDrafts = new Map();
 const clinicTasks = new Map();
 let taskReminderTemplate = null;
 const createdAppointments = [];
 let upcomingAppointments = [];
+const events = new Map();
+const calendarPatches = [];
+let busyPeriods = [];
+const mockCalendarId = 'test-calendar';
+process.env.GOOGLE_CALENDAR_ID = mockCalendarId;
+process.env.GOOGLE_PRIVATE_KEY = 'test-google-key';
+process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL = 'test@demo.invalid';
+globalThis.testGoogle = {
+  auth: { JWT: class {} },
+  calendar: () => ({
+    freebusy: { query: async () => ({ data: { calendars: { [mockCalendarId]: { busy: busyPeriods } } } }) },
+    events: {
+      get: async ({ eventId }) => {
+        if (!events.has(eventId)) throw Object.assign(new Error('Missing event'), { code: 404 });
+        return { data: structuredClone(events.get(eventId)) };
+      },
+      list: async ({ privateExtendedProperty }) => ({
+        data: { items: [...events.values()].filter(event => !privateExtendedProperty ||
+          privateExtendedProperty.includes(`patientPhone=${event.extendedProperties.private.patientPhone}`)) },
+      }),
+      patch: async ({ eventId, requestBody }, options) => {
+        const event = events.get(eventId);
+        assert.equal(options.headers['If-Match'], event.etag);
+        calendarPatches.push({ eventId, requestBody });
+        const updated = { ...event, ...requestBody, etag: `v${calendarPatches.length + 1}` };
+        events.set(eventId, updated);
+        return { data: updated };
+      },
+    },
+  }),
+};
+const liveCalendar = await import('../src/lib/calendar.ts');
 const calendarSlots = ['16:00', '17:00', '18:00'].map(hour => ({
   start: `2099-11-20T${hour}:00-06:00`,
   end: `2099-11-20T${hour.replace(':00', ':45')}:00-06:00`,
@@ -47,8 +83,11 @@ globalThis.testCalendar = {
     createdAppointments.push(params);
     return calendarSlots.find(slot => slot.start === params.startTime);
   },
-  getPatientAppointments: async () => [],
-  getAppointmentsByDateRange: async () => upcomingAppointments,
+  getPatientAppointments: liveCalendar.getPatientAppointments,
+  getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
+  getCalendarAppointment: liveCalendar.getCalendarAppointment,
+  moveCalendarAppointment: liveCalendar.moveCalendarAppointment,
+  confirmCalendarAttendance: liveCalendar.confirmCalendarAttendance,
   appointmentPatientName: summary => summary.replace(/^Cita: /, ''),
 };
 const treatments = Array.from({ length: 12 }, (_, i) => ({
@@ -131,6 +170,9 @@ function query(table) {
         const key = JSON.stringify(values);
         if (notices.has(key)) return resolve({ error: { code: '23505' } });
         notices.add(key);
+      }
+      if (table === 'appointment_notices' && operation === 'select') {
+        return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
       if (table === 'patients' && operation === 'select') {
         return resolve({ data: { phone: filters.phone, full_name: 'Ana Demo', chat_mode: 'AI_ACTIVE', human_session_id: null } });
@@ -230,6 +272,99 @@ function answerButton(id, button, from = patient) {
 function lastButtons() {
   return metaRequests.at(-1).interactive.action.buttons.map(button => button.reply.id);
 }
+
+function seedPatientAppointment() {
+  const event = {
+    id: 'calendar-existing-event',
+    etag: 'v1',
+    summary: 'Cita: Ana Demo',
+    description: 'Motivo original',
+    visibility: 'private',
+    start: { dateTime: '2099-11-20T16:00:00-06:00' },
+    end: { dateTime: '2099-11-20T17:00:00-06:00' },
+    extendedProperties: { private: { patientPhone: patient, clinicMetadata: 'original' } },
+  };
+  events.set(event.id, event);
+  return event;
+}
+
+test('a WhatsApp reminder reply confirms attendance for its owner and reception sees it', async () => {
+  const event = seedPatientAppointment();
+  const reminderId = 'test-reminder';
+  reminderReplies.set(reminderId, { event_id: event.id, scheduled_start: event.start.dateTime });
+  const patches = calendarPatches.length;
+  const message = (id, phone = patient) => ({ ...textMessage(id, 'Confirmo', phone), context: { id: reminderId } });
+  try {
+    await webhook([message('attendance-other-owner', '525500000003')]);
+    assert.equal(calendarPatches.length, patches);
+    await webhook([message('attendance-on-reminder'), message('attendance-twice')]);
+    assert.equal(calendarPatches.length, patches + 1);
+    assert.match(metaRequests.at(-1).text.body, /Asistencia confirmada/);
+    await webhook([answerButton('view-confirmed-roster', 'admin_agenda', process.env.ADMIN_PHONE_NUMBER)]);
+    assert.match(metaRequests.at(-1).text.body, /Ana Demo · Asistencia confirmada/);
+  } finally {
+    reminderReplies.clear();
+    events.clear();
+  }
+});
+
+test('rescheduling patches only the existing Calendar event and resets stale attendance', async () => {
+  const event = seedPatientAppointment();
+  event.extendedProperties.private.attendanceConfirmedFor = event.start.dateTime;
+  const created = createdAppointments.length;
+  const patches = calendarPatches.length;
+  try {
+    await webhook([textMessage('move-mis-citas', 'Mis citas')]);
+    const oldMove = lastButtons().find(id => id.startsWith('appt_move_'));
+    await webhook([answerButton('move-options', oldMove)]);
+    await webhook([answerButton('pick-reschedule', lastButtons()[0])]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Confirma el cambio de horario/);
+    const confirm = lastButtons()[0];
+    await Promise.all([webhook([answerButton('move-yes', confirm)]), webhook([answerButton('move-duplicate', confirm)])]);
+    assert.equal(events.size, 1);
+    assert.equal(createdAppointments.length, created);
+    assert.equal(calendarPatches.length, patches + 1);
+    assert.equal(calendarPatches.at(-1).eventId, event.id);
+    const updated = events.get(event.id);
+    assert.equal(updated.start.dateTime, '2099-11-20T23:00:00.000Z');
+    assert.equal(updated.end.dateTime, '2099-11-21T00:00:00.000Z');
+    assert.equal(updated.description, event.description);
+    assert.equal(updated.visibility, 'private');
+    assert.equal(updated.extendedProperties.private.clinicMetadata, 'original');
+    assert.equal(updated.extendedProperties.private.attendanceConfirmedFor, 'pending');
+    const reminderId = 'pre-move-reminder';
+    reminderReplies.set(reminderId, { event_id: event.id, scheduled_start: event.start.dateTime });
+    await webhook([{ ...textMessage('old-time-confirmation', 'Confirmo'), context: { id: reminderId } }]);
+    assert.match(metaRequests.at(-1).text.body, /horario que cambió/);
+    assert.equal(calendarPatches.length, patches + 1);
+    await webhook([answerButton('view-pending-roster', 'admin_agenda', process.env.ADMIN_PHONE_NUMBER)]);
+    assert.match(metaRequests.at(-1).text.body, /Ana Demo · Asistencia pendiente/);
+  } finally {
+    bookingDrafts.delete(patient);
+    reminderReplies.clear();
+    events.clear();
+  }
+});
+
+test('if the new slot becomes busy, the existing appointment keeps its original time', async () => {
+  const event = seedPatientAppointment();
+  const patches = calendarPatches.length;
+  try {
+    await webhook([textMessage('busy-mis-citas', 'Mis citas')]);
+    await webhook([answerButton('busy-move-options', lastButtons().find(id => id.startsWith('appt_move_')))]);
+    await webhook([answerButton('busy-move-pick', lastButtons()[0])]);
+    busyPeriods = [{ start: '2099-11-20T23:00:00Z', end: '2099-11-21T00:00:00Z' }];
+    const before = metaRequests.length;
+    await webhook([answerButton('busy-move-confirm', lastButtons()[0])]);
+    assert.equal(calendarPatches.length, patches);
+    assert.equal(events.get(event.id).start.dateTime, event.start.dateTime);
+    assert.match(metaRequests[before].text.body, /conserva el horario original/);
+  } finally {
+    busyPeriods = [];
+    bookingDrafts.delete(patient);
+    events.clear();
+  }
+});
 
 test('a clinic echo, delivery status, or stale reply cannot reopen the menu', async () => {
   const count = metaRequests.length;

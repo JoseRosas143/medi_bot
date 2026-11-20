@@ -22,8 +22,7 @@ export async function proposeAppointmentAction(phone: string, action: Cancellati
   });
 }
 
-export async function bookWithLock(booking: Parameters<typeof createCalendarAppointment>[0]) {
-  const id = booking.actionId;
+export async function withCalendarLock<T>(id: string, change: () => Promise<T>) {
   const now = new Date();
   const lock = { id: 1, holder: id, expires_at: new Date(now.getTime() + 120_000).toISOString() };
   const { error } = await db.from('calendar_booking_lock').insert(lock);
@@ -36,12 +35,18 @@ export async function bookWithLock(booking: Parameters<typeof createCalendarAppo
   }
 
   try {
-    const slot = await createCalendarAppointment(booking);
-    return slot ? { state: 'confirmed', label: slot.label } as const : { state: 'unavailable' } as const;
+    return await change();
   } finally {
     const { error: releaseError } = await db.from('calendar_booking_lock').delete().eq('id', 1).eq('holder', id);
     if (releaseError) console.error('Could not release booking lock');
   }
+}
+
+export function bookWithLock(booking: Parameters<typeof createCalendarAppointment>[0]) {
+  return withCalendarLock(booking.actionId, async () => {
+    const slot = await createCalendarAppointment(booking);
+    return slot ? { state: 'confirmed', label: slot.label } as const : { state: 'unavailable' } as const;
+  });
 }
 
 export async function handleAppointmentAction(phone: string, optionId: string | undefined, isAdmin: boolean) {

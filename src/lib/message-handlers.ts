@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { getPatientAppointments } from '@/lib/calendar';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
 import { handleAppointmentAction } from '@/lib/appointment-actions';
 import { handleBooking, startBooking } from '@/lib/booking';
+import { handlePatientAppointments, showPatientAppointments } from '@/lib/patient-appointments';
 import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { runAdminAgent, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
@@ -144,9 +144,11 @@ export async function handlePatientMessage(message: IncomingMessage) {
   if (optionId === 'agendar' || (!optionId && /^(?:(?:quiero|deseo|necesito) )?(?:agendar|reservar|hacer|sacar) (?:una )?cita$/.test(text))) {
     return startBooking(from, false, fullName);
   }
-  const menuNavigation = !optionId && (menuRequests.has(text) || text === 'mis citas' ||
+  if (await handlePatientAppointments(from, content, optionId, message.contextMessageId)) return;
+  const menuNavigation = !optionId && (menuRequests.has(text) ||
     ['tratamientos', 'tratamientos y precios', 'tratamientos/precios', 'preguntas frecuentes', 'info y politicas'].includes(text));
   if (!menuNavigation && await handleBooking(from, optionId, content)) return;
+  if (!optionId && /^(?:(?:si,?\s+)?confirmo|cambiar horario)$/.test(text)) return void await showPatientAppointments(from);
   if (!fullName) {
     if (optionId) return;
     const name = !inserted || /^(?:soy|me llamo|mi nombre es)\s/.test(text) ? parseName(content) : null;
@@ -174,12 +176,6 @@ export async function handlePatientMessage(message: IncomingMessage) {
       await sendCatalogDetail(from, catalog, id, detail);
       await history(from, 'assistant', detail);
     }
-    return;
-  }
-  if (optionId === 'cancelar' || text === 'mis citas') {
-    const events = (await getPatientAppointments(from)).slice(0, 10);
-    await history(from, 'user', 'Quiero consultar mis citas.');
-    await reply(events.length ? `🗓️ *Tus próximas citas*\n${events.map(event => `• ${formatAppointment(event.start)}`).join('\n')}\n\nSi quieres cancelar, dime cuál.` : 'No encontré citas futuras asociadas a tu WhatsApp.');
     return;
   }
   if (optionId) return;

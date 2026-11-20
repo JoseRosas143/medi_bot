@@ -10,7 +10,7 @@ import { sendWhatsAppText } from '@/lib/whatsapp';
 
 export async function showSchedule(phone: string, date = clinicDate(), events?: CalendarEventData[]) {
   const appointments = events ?? await getAppointmentsByDateRange(...clinicDayRange(date));
-  const lines = appointments.slice(0, 25).map(event => `• ${formatAppointment(event.start)} — ${event.summary}`);
+  const lines = appointments.slice(0, 25).map(event => `• ${formatAppointment(event.start)} — ${event.summary}${event.patientPhone ? event.attendanceConfirmed ? ' · Asistencia confirmada' : ' · Asistencia pendiente' : ''}`);
   await sendWhatsAppText(phone, `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}`);
 }
 

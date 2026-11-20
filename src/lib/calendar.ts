@@ -10,6 +10,7 @@ export interface CalendarEventData {
   start: string;
   end: string;
   patientPhone: string;
+  attendanceConfirmed?: boolean;
 }
 
 function getCalendarClient() {
@@ -29,7 +30,11 @@ function eventContact(event: calendar_v3.Schema$Event): string {
 function toAppointment(event: calendar_v3.Schema$Event): CalendarEventData | null {
   const { id, start, end, summary, status } = event;
   if (status === 'cancelled' || !id || !start?.dateTime || !end?.dateTime) return null;
-  return { eventId: id, summary: summary || 'Cita', start: start.dateTime, end: end.dateTime, patientPhone: eventContact(event) };
+  const confirmedFor = event.extendedProperties?.private?.attendanceConfirmedFor;
+  return {
+    eventId: id, summary: summary || 'Cita', start: start.dateTime, end: end.dateTime, patientPhone: eventContact(event),
+    attendanceConfirmed: Boolean(confirmedFor && Date.parse(confirmedFor) === Date.parse(start.dateTime)),
+  };
 }
 
 async function getBusySlots(start: string, end: string) {
@@ -49,8 +54,7 @@ function workingHours(date: string) {
   return { opening, closing };
 }
 
-function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$TimePeriod[], after: number) {
-  const duration = APPOINTMENT_MINUTES * 60_000;
+function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$TimePeriod[], after: number, duration: number) {
   const slots = [];
   for (let start = opening.getTime(); start + duration <= closing.getTime(); start += 15 * 60_000) {
     const end = start + duration;
@@ -61,22 +65,22 @@ function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$T
   return slots;
 }
 
-export async function getAvailableSlots(date: string) {
+export async function getAvailableSlots(date: string, duration = APPOINTMENT_MINUTES * 60_000) {
   const { opening, closing } = workingHours(date);
   const now = Date.now();
   if (closing.getTime() <= now) return { date, slots: [] };
   const busy = await getBusySlots(opening.toISOString(), closing.toISOString());
-  return { date, slots: availableSlots(opening, closing, busy, now) };
+  return { date, slots: availableSlots(opening, closing, busy, now, duration) };
 }
 
-export async function getUpcomingSlots(after = Date.now()) {
+export async function getUpcomingSlots(after = Date.now(), duration = APPOINTMENT_MINUTES * 60_000) {
   const earliest = Math.max(after, Date.now());
   const days = [];
   for (let date = clinicDate(new Date(earliest)), index = 0; index < 14; index++, date = nextDate(date)) {
     days.push(workingHours(date));
   }
   const busy = await getBusySlots(days[0].opening.toISOString(), days[days.length - 1].closing.toISOString());
-  return days.flatMap(({ opening, closing }) => availableSlots(opening, closing, busy, earliest));
+  return days.flatMap(({ opening, closing }) => availableSlots(opening, closing, busy, earliest, duration));
 }
 
 export async function createCalendarAppointment(params: {
@@ -105,14 +109,20 @@ export async function createCalendarAppointment(params: {
 }
 
 export async function findCalendarBooking(actionId: string) {
+  return getCalendarAppointment(actionId.replaceAll('-', ''));
+}
+
+function calendarErrorCode(error: unknown) {
+  return typeof error === 'object' && error !== null && 'code' in error ? Number(error.code) : 0;
+}
+
+export async function getCalendarAppointment(eventId: string) {
   const { calendar, calendarId } = getCalendarClient();
   try {
-    const { data } = await calendar.events.get({ calendarId, eventId: actionId.replaceAll('-', '') }, { timeout: 8_000 });
+    const { data } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
     return toAppointment(data);
   } catch (error) {
-    if (typeof error === 'object' && error !== null && 'code' in error && [404, 410].includes(Number(error.code))) {
-      return null;
-    }
+    if ([404, 410].includes(calendarErrorCode(error))) return null;
     throw error;
   }
 }
@@ -147,6 +157,57 @@ export async function getPatientAppointments(patientPhone: string) {
 
 export function appointmentPatientName(summary: string) {
   return summary.replace(/^(\[URGENTE\]\s*)?Cita:\s*/i, '').trim() || 'Paciente';
+}
+
+async function updatePatientAppointment(
+  expected: CalendarEventData,
+  ownerPhone: string,
+  newStart?: string,
+) {
+  const { calendar, calendarId } = getCalendarClient();
+  const eventId = expected.eventId;
+  try {
+    const { data } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
+    const current = toAppointment(data);
+    if (!current || !data.etag || current.patientPhone !== ownerPhone || !ownerPhone ||
+        Date.parse(current.start) <= Date.now() || Date.parse(current.start) !== Date.parse(expected.start)) {
+      return { state: 'changed' } as const;
+    }
+    if (!newStart && current.attendanceConfirmed) return { state: 'confirmed', label: formatAppointment(current.start) } as const;
+
+    let target = current.start;
+    const requestBody: calendar_v3.Schema$Event = {};
+    if (newStart) {
+      const date = new Date(newStart);
+      const duration = Date.parse(current.end) - Date.parse(current.start);
+      if (!Number.isFinite(date.getTime()) || !Number.isFinite(duration) || duration <= 0) return { state: 'unavailable' } as const;
+      const availability = await getAvailableSlots(clinicDate(date), duration);
+      const slot = availability.slots.find(item => item.start === date.toISOString());
+      if (!slot || Date.parse(slot.start) === Date.parse(current.start)) return { state: 'unavailable' } as const;
+      target = slot.start;
+      requestBody.start = { dateTime: slot.start, timeZone: CLINIC_TIMEZONE };
+      requestBody.end = { dateTime: slot.end, timeZone: CLINIC_TIMEZONE };
+    }
+    requestBody.extendedProperties = { private: {
+      ...data.extendedProperties?.private,
+      attendanceConfirmedFor: newStart ? 'pending' : new Date(current.start).toISOString(),
+    } };
+    await calendar.events.patch({ calendarId, eventId, requestBody, sendUpdates: 'none' }, {
+      headers: { 'If-Match': data.etag }, timeout: 10_000,
+    });
+    return { state: 'confirmed', label: formatAppointment(target) } as const;
+  } catch (error) {
+    if ([404, 410, 412].includes(calendarErrorCode(error))) return { state: 'changed' } as const;
+    throw error;
+  }
+}
+
+export function confirmCalendarAttendance(expected: CalendarEventData, ownerPhone: string) {
+  return updatePatientAppointment(expected, ownerPhone);
+}
+
+export function moveCalendarAppointment(expected: CalendarEventData, ownerPhone: string, newStart: string) {
+  return updatePatientAppointment(expected, ownerPhone, newStart);
 }
 
 export async function cancelCalendarEvent(expected: CalendarEventData, ownerPhone?: string) {
