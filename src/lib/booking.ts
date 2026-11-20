@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { bookWithLock } from '@/lib/appointment-actions';
-import { findCalendarBooking, getAvailableSlots, getUpcomingSlots } from '@/lib/calendar';
-import { CLINIC_TIMEZONE, clinicDate, clinicInstant, nextDate } from '@/lib/clinic-time';
+import { bookWithLock, withCalendarLock } from '@/lib/appointment-actions';
+import { findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
+import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { normalized } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -13,6 +13,7 @@ type Details = {
   patientName?: string;
   patientPhone?: string;
   reason?: string;
+  original?: CalendarEventData;
 };
 type Stage = 'search' | 'options' | 'name' | 'contact' | 'reason' | 'confirm' | 'processing' | 'confirmed';
 type Draft = { actor_phone: string; id: string; revision: string; stage: Stage; details: Details; expires_at: string };
@@ -93,9 +94,12 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
   let slots: Slot[];
   let preferred: Slot | undefined;
   let label = '';
+  const original = next.details.original;
+  const duration = original ? Date.parse(original.end) - Date.parse(original.start) : undefined;
+  const otherSlots = (slots: Slot[]) => slots.filter(slot => !original || Date.parse(slot.start) !== Date.parse(original.start));
   if (preference) {
-    const day = await getAvailableSlots(preference.date);
-    slots = day.slots;
+    const day = await getAvailableSlots(preference.date, duration);
+    slots = otherSlots(day.slots);
     if (preference.time) {
       preferred = slots.find(slot => localTime.format(new Date(slot.start)) === preference.time)
         ?? slots.find(slot => localTime.format(new Date(slot.start)) === preference.alternative);
@@ -103,11 +107,11 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
     }
     if (!slots.length) {
       const nextDay = nextDate(preference.date);
-      slots = await getUpcomingSlots(clinicInstant(nextDay, '00:00').getTime() - 1);
+      slots = otherSlots(await getUpcomingSlots(clinicInstant(nextDay, '00:00').getTime() - 1, duration));
       label = 'No encontré espacios para ese día. ';
     }
   } else {
-    slots = await getUpcomingSlots(after);
+    slots = otherSlots(await getUpcomingSlots(after, duration));
   }
   const options = chooseSlots(slots, preferred?.start);
   const updated = await replaceDraft(next, 'options', { ...next.details, options });
@@ -118,7 +122,7 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
   }
   await sendWhatsAppInteractiveButtons({
     to: phone,
-    bodyText: `🗓️ *Horarios disponibles*\n${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${slot.label}`).join('\n')}`,
+    bodyText: `🗓️ *Horarios disponibles*\n${original ? `Cita actual: ${formatAppointment(original.start)}\n` : ''}${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${slot.label}`).join('\n')}`,
     buttons: [
       ...options.map((slot, index) => ({ id: buttonId(updated, String(index)), title: shortSlot.format(new Date(slot.start)) })),
       { id: buttonId(updated, 'more'), title: 'Ver otros horarios' },
@@ -127,21 +131,34 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
 }
 
 export async function startBooking(phone: string, isAdmin: boolean, patientName?: string | null, treatment?: string, request?: string) {
+  await openDraft(phone, {
+    patientPhone: isAdmin ? undefined : phone,
+    patientName: isAdmin ? undefined : fullName(patientName || '') || undefined,
+    reason: treatment,
+  }, request);
+}
+
+export async function startReschedule(phone: string, original: CalendarEventData, request?: string) {
+  const duration = Date.parse(original.end) - Date.parse(original.start);
+  if (original.patientPhone !== phone || !Number.isFinite(duration) || duration <= 0) {
+    await sendWhatsAppText(phone, 'Consulta con recepción para cambiar esta cita.');
+    return;
+  }
+  await openDraft(phone, { patientPhone: phone, original }, request);
+}
+
+async function openDraft(phone: string, details: Details, request?: string) {
   const previous = await readDraft(phone);
   if (previous?.stage === 'processing') {
     await checkProcessing(previous);
     return;
   }
-  const details = {
-    patientPhone: isAdmin ? undefined : phone,
-    patientName: isAdmin ? undefined : fullName(patientName || '') || undefined,
-    reason: treatment,
-  };
   const draft = previous
     ? await replaceDraft(previous, 'search', details, randomUUID())
     : await insertDraft(phone, details);
   if (!draft) return stale(phone);
-  const preference = request ? requestedSchedule(request, clinicDate()) : null;
+  const referenceDate = details.original ? clinicDate(new Date(details.original.start)) : clinicDate();
+  const preference = request ? requestedSchedule(request, referenceDate) : null;
   await offer(draft, preference);
 }
 
@@ -182,7 +199,16 @@ async function advance(draft: Draft, details: Details) {
 }
 
 async function showConfirmation(draft: Draft) {
-  const { selected, patientName, patientPhone, reason } = draft.details;
+  const { selected, patientName, patientPhone, reason, original } = draft.details;
+  if (original && selected) return sendWhatsAppInteractiveButtons({
+    to: draft.actor_phone,
+    bodyText: `*Confirma el cambio de horario*\nCita actual: ${formatAppointment(original.start)}\nNuevo horario: ${selected.label}`,
+    buttons: [
+      { id: buttonId(draft, 'confirm'), title: 'Confirmar cambio' },
+      { id: buttonId(draft, 'more'), title: 'Ver otros horarios' },
+      { id: buttonId(draft, 'leave'), title: 'Conservar mi cita' },
+    ],
+  });
   if (!selected || !patientName || !patientPhone || !reason) return stale(draft.actor_phone);
   return sendWhatsAppInteractiveButtons({
     to: draft.actor_phone,
@@ -197,35 +223,51 @@ async function showConfirmation(draft: Draft) {
 
 async function markConfirmed(draft: Draft) {
   const updated = await replaceDraft(draft, 'confirmed', { selected: draft.details.selected });
-  if (updated) await sendWhatsAppText(draft.actor_phone, `✅ *Cita confirmada*\n${draft.details.selected!.label}`);
+  if (updated) await sendWhatsAppText(draft.actor_phone, `✅ *${draft.details.original ? 'Cita reagendada' : 'Cita confirmada'}*\n${draft.details.selected!.label}${draft.details.original ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : ''}`);
+}
+
+async function finishUnchanged(draft: Draft, message: string) {
+  const { data } = await drafts().update({ stage: 'options', expires_at: new Date().toISOString(), details: {}, revision: randomUUID() })
+    .eq('actor_phone', draft.actor_phone).eq('revision', draft.revision).select('id').maybeSingle().throwOnError();
+  if (data) await sendWhatsAppText(draft.actor_phone, message);
 }
 
 async function checkProcessing(draft: Draft) {
   const phone = draft.actor_phone;
   if (current(draft)) return sendWhatsAppText(phone, 'La agenda está confirmando tu cita. Espera la respuesta antes de iniciar otra.');
-  const event = await findCalendarBooking(draft.id);
+  const original = draft.details.original;
+  const event = original ? await getCalendarAppointment(original.eventId) : await findCalendarBooking(draft.id);
   if (event && event.patientPhone === draft.details.patientPhone && Date.parse(event.start) === Date.parse(draft.details.selected?.start || '')) {
     return markConfirmed(draft);
   }
-  if (event) return sendWhatsAppText(phone, 'Revisa «Mis citas» o consulta con recepción antes de reservar otra.');
+  if (original && (!event || event.patientPhone !== phone || Date.parse(event.start) !== Date.parse(original.start))) {
+    return finishUnchanged(draft, 'La cita cambió en la agenda. Consulta su estado en «Mis citas».');
+  }
+  if (!original && event) return sendWhatsAppText(phone, 'Revisa «Mis citas» o consulta con recepción antes de reservar otra.');
   const updated = await replaceDraft(draft, 'confirm', draft.details);
   if (updated) await showConfirmation(updated);
 }
 
 async function confirm(draft: Draft) {
-  const { selected, patientName, patientPhone, reason } = draft.details;
-  if (!selected || !patientName || !patientPhone || !reason) return stale(draft.actor_phone);
+  const { selected, patientName, patientPhone, reason, original } = draft.details;
+  if (!selected || !patientPhone) return stale(draft.actor_phone);
+  if (!original && (!patientName || !reason)) return stale(draft.actor_phone);
   const lock = await replaceDraft(draft, 'processing', draft.details);
   if (!lock) return stale(draft.actor_phone);
   try {
-    const result = await bookWithLock({ actionId: lock.id, patientName, patientPhone, reason, startTime: selected.start });
+    const result = original
+      ? await withCalendarLock(lock.id, () => moveCalendarAppointment(original, draft.actor_phone, selected.start))
+      : await bookWithLock({ actionId: lock.id, patientName: patientName!, patientPhone, reason: reason!, startTime: selected.start });
     if (result.state === 'confirmed') return markConfirmed(lock);
+    if (result.state === 'changed') return finishUnchanged(lock, 'La cita cambió en la agenda. Abre «Mis citas» para ver el horario vigente.');
     if (result.state === 'busy') {
       const updated = await replaceDraft(lock, 'confirm', lock.details);
       if (updated) await showConfirmation(updated);
       return;
     }
-    await sendWhatsAppText(draft.actor_phone, 'Ese horario se ocupó antes de confirmar. Te muestro otras opciones.');
+    await sendWhatsAppText(draft.actor_phone, original
+      ? 'Ese horario se ocupó. Tu cita conserva el horario original. Te muestro otras opciones.'
+      : 'Ese horario se ocupó antes de confirmar. Te muestro otras opciones.');
     await offer(lock);
   } catch {
     // Keep the deterministic Calendar ID and reconcile before offering another reservation.
@@ -234,7 +276,7 @@ async function confirm(draft: Draft) {
 }
 
 export async function handleBooking(phone: string, option: string | undefined, content: string): Promise<boolean> {
-  const button = option?.match(/^booking_([\da-f-]{36})_(0|1|more|name|edit|confirm)$/i);
+  const button = option?.match(/^booking_([\da-f-]{36})_(0|1|more|name|edit|confirm|leave)$/i);
   if (option && !button) return false;
   const draft = await readDraft(phone);
   if (!draft || (!current(draft) && draft.stage !== 'processing')) {
@@ -272,8 +314,10 @@ export async function handleBooking(phone: string, option: string | undefined, c
     const slot = draft.details.options?.[index];
     if (!slot) await sendWhatsAppText(phone, 'Toca uno de los horarios disponibles o escribe «otros horarios».');
     else {
-      const updated = await replaceDraft(draft, 'name', { ...draft.details, selected: slot });
-      if (updated) await askName(updated);
+      const moving = Boolean(draft.details.original);
+      const updated = await replaceDraft(draft, moving ? 'confirm' : 'name', { ...draft.details, selected: slot });
+      if (updated && moving) await showConfirmation(updated);
+      else if (updated) await askName(updated);
     }
   } else if (draft.stage === 'name') {
     const name = action === 'name' ? draft.details.patientName : !button ? fullName(content) : null;
@@ -294,6 +338,7 @@ export async function handleBooking(phone: string, option: string | undefined, c
     } else await advance(draft, { ...draft.details, reason });
   } else if (draft.stage === 'confirm') {
     if (button && action === 'confirm') await confirm(draft);
+    else if (button && action === 'leave' && draft.details.original) await finishUnchanged(draft, 'Tu cita conserva el horario original.');
     else if (button && action === 'edit') {
       const updated = await replaceDraft(draft, 'name', { ...draft.details, patientName: undefined, reason: undefined });
       if (updated) await askName(updated);
