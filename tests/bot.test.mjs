@@ -9,7 +9,7 @@ const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
     cancelCalendarEvent, getPatientAppointments, findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, appointmentPatientName,
     getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot,
-    saveCalendarAppointmentContact } = globalThis.testCalendar;
+    saveCalendarAppointmentContact, recordCalendarVisit } = globalThis.testCalendar;
 `);
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -109,6 +109,7 @@ globalThis.testCalendar = {
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
   cancelCalendarEvent: liveCalendar.cancelCalendarEvent,
   saveCalendarAppointmentContact: liveCalendar.saveCalendarAppointmentContact,
+  recordCalendarVisit: liveCalendar.recordCalendarVisit,
   appointmentMatchesSlot: liveCalendar.appointmentMatchesSlot,
   moveCalendarAppointment: liveCalendar.moveCalendarAppointment,
   confirmCalendarAttendance: liveCalendar.confirmCalendarAttendance,
@@ -257,7 +258,7 @@ globalThis.fetch = async (url, options) => {
 
 const { POST: whatsapp } = await import('../src/app/api/webhook/whatsapp/route.ts');
 const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts');
-const { clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
+const { clinicDate, clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
 const { proposeAppointmentAction } = await import('../src/lib/appointment-actions.ts');
@@ -598,9 +599,51 @@ test('a WhatsApp reminder reply confirms attendance for its owner and reception 
     assert.equal(calendarPatches.length, patches + 1);
     assert.match(metaRequests.at(-1).text.body, /Asistencia confirmada/);
     await webhook([answerButton('view-confirmed-roster', 'admin_agenda', process.env.ADMIN_PHONE_NUMBER)]);
-    assert.match(metaRequests.at(-1).text.body, /Ana Demo · Asistencia confirmada/);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo · Asistencia confirmada/);
   } finally {
     reminderReplies.clear();
+    events.clear();
+  }
+});
+
+test('reception views tomorrow and records a visit once without changing the Calendar appointment', async () => {
+  const event = seedPatientAppointment();
+  const today = clinicDate();
+  const start = Math.max(Date.parse(clinicDayRange(today)[0]), Date.now() - 3_600_000);
+  event.start.dateTime = new Date(start).toISOString();
+  event.end.dateTime = new Date(start + 2_700_000).toISOString();
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const patches = calendarPatches.length;
+  const requests = metaRequests.length;
+  try {
+    await webhook([answerButton('new-roster-today', 'admin_agenda', admin)]);
+    assert.ok(lastButtons().includes('rec_tomorrow'));
+    await webhook([answerButton('new-roster-tomorrow', 'rec_tomorrow', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, new RegExp(nextDate(today)));
+    await webhook([answerButton('new-roster-register', 'rec_visits_0', admin)]);
+    const pick = metaRequests.at(-1).interactive.action.sections[0].rows[0].id;
+    await webhook([answerButton('new-roster-select', pick, admin)]);
+    const [arrived, noShow] = lastButtons();
+    await webhook([answerButton('patient-cannot-mark-visit', arrived, patient)]);
+    assert.equal(calendarPatches.length, patches);
+    await webhook([answerButton('new-roster-arrived', arrived, admin)]);
+    assert.match(metaRequests.at(-1).text.body, /Llegó/);
+    await webhook([answerButton('new-roster-stale-no-show', noShow, admin)]);
+    assert.equal(calendarPatches.length, patches + 1);
+    const saved = events.get(event.id);
+    assert.deepEqual(saved.start, event.start);
+    assert.deepEqual(saved.end, event.end);
+    assert.equal(saved.extendedProperties.private.clinicMetadata, 'original');
+    assert.equal(saved.extendedProperties.private.visitStatus, 'arrived');
+    await webhook([answerButton('reception-visit-on-roster', 'admin_agenda', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo · Llegó/);
+    await webhook([answerButton('reopen-registered-visits', 'rec_visits_0', admin)]);
+    const current = metaRequests.at(-1).interactive.action.sections[0].rows[0].id;
+    await webhook([answerButton('reopen-visit-status', current, admin)]);
+    await webhook([answerButton('record-no-show-after-review', lastButtons()[1], admin)]);
+    assert.equal(events.get(event.id).extendedProperties.private.visitStatus, 'no_show');
+    assert.ok(metaRequests.slice(requests).every(message => message.type !== 'template'));
+  } finally {
     events.clear();
   }
 });
@@ -635,7 +678,7 @@ test('rescheduling patches only the existing Calendar event and resets stale att
     assert.match(metaRequests.at(-1).text.body, /horario que cambió/);
     assert.equal(calendarPatches.length, patches + 1);
     await webhook([answerButton('view-pending-roster', 'admin_agenda', process.env.ADMIN_PHONE_NUMBER)]);
-    assert.match(metaRequests.at(-1).text.body, /Ana Demo · Asistencia pendiente/);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo · Asistencia pendiente/);
   } finally {
     bookingDrafts.delete(patient);
     reminderReplies.clear();
