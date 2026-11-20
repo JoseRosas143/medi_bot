@@ -31,6 +31,8 @@ const receipts = new Set();
 const notices = new Set();
 const saved = [];
 const bookingDrafts = new Map();
+const clinicTasks = new Map();
+let taskReminderTemplate = null;
 const createdAppointments = [];
 let upcomingAppointments = [];
 const calendarSlots = ['16:00', '17:00', '18:00'].map(hour => ({
@@ -58,17 +60,54 @@ function query(table) {
   let operation = 'select';
   let values;
   const filters = {};
+  const constraints = [];
+  let singleRow = false;
+  let limit;
+  let sort;
   let range;
   const chain = {
-    select: () => chain, order: () => chain, maybeSingle: () => chain, single: () => chain, or: () => chain,
+    select: () => chain,
+    order: (field, options) => { sort = { field, ascending: options?.ascending !== false }; return chain; },
+    maybeSingle: () => { singleRow = true; return chain; },
+    single: () => { singleRow = true; return chain; },
+    or: rule => {
+      if (rule === 'reminder_state.is.null,reminder_state.neq.sending') constraints.push(row => row.reminder_state !== 'sending');
+      return chain;
+    },
     eq: (field, value) => { filters[field] = value; return chain; },
-    in: () => chain, match: () => chain, gt: () => chain, delete: () => chain,
+    in: (field, choices) => { constraints.push(row => choices.includes(row[field])); return chain; },
+    lt: (field, value) => { constraints.push(row => row[field] != null && row[field] < value); return chain; },
+    lte: (field, value) => { constraints.push(row => row[field] != null && row[field] <= value); return chain; },
+    limit: value => { limit = value; return chain; },
+    match: () => chain, gt: () => chain, delete: () => chain,
     insert: value => { operation = 'insert'; values = value; return chain; },
     upsert: value => { operation = 'upsert'; values = value; return chain; },
     update: value => { operation = 'update'; values = value; return chain; },
     range: (from, to) => { range = [from, to]; return chain; },
     throwOnError: () => chain,
     then: resolve => {
+      if (table === 'bot_settings' && operation === 'select') {
+        return resolve({ data: { task_reminder_template: taskReminderTemplate }, error: null });
+      }
+      if (table === 'clinic_tasks') {
+        if (operation === 'insert') {
+          const id = clinicTasks.size + 1;
+          const row = { id, is_completed: false, reminder_at: null, reminder_state: null, ...values };
+          clinicTasks.set(id, row);
+          return resolve({ data: row, error: null });
+        }
+        let rows = [...clinicTasks.values()].filter(row =>
+          Object.entries(filters).every(([field, value]) => row[field] === value) && constraints.every(check => check(row)),
+        );
+        if (operation === 'update') rows.forEach(row => Object.assign(row, values));
+        if (sort) {
+          rows.sort((a, b) => Number(a[sort.field] > b[sort.field]) - Number(a[sort.field] < b[sort.field]));
+          if (!sort.ascending) rows.reverse();
+        }
+        if (range) rows = rows.slice(range[0], range[1] + 1);
+        if (limit) rows = rows.slice(0, limit);
+        return resolve({ data: singleRow ? rows[0] ?? null : rows, error: null });
+      }
       if (table === 'booking_drafts') {
         if (operation === 'insert') {
           if (bookingDrafts.has(values.actor_phone)) return resolve({ error: { code: '23505' } });
@@ -116,6 +155,7 @@ const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts'
 const { clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
+const { addClinicTask, scheduleClinicTask } = await import('../src/lib/clinic-tasks.ts');
 const { transcribeWhatsAppAudio } = await import('../src/lib/audio.ts');
 const patient = '525500000002';
 
@@ -298,6 +338,56 @@ test('an authenticated cron run sends an appointment template and never the welc
     assert.equal(metaRequests.at(-1).type, 'template');
   } finally {
     upcomingAppointments = [];
+  }
+});
+
+test('the admin can list open tasks and set a future reminder on an existing task', async () => {
+  clinicTasks.clear();
+  delete process.env.WHATSAPP_TASK_REMINDER_TEMPLATE;
+  await addClinicTask({ description: 'Pedir guantes' });
+  assert.match(await addClinicTask({ description: 'Sin hora', reminder_requested: true, date: '2099-11-20' }), /fecha y hora futuras/);
+  assert.equal(clinicTasks.size, 1);
+  assert.match(await scheduleClinicTask(1, '2099-11-20', '09:00'), /pendiente de activar/);
+  assert.equal(clinicTasks.get(1).reminder_at, '2099-11-20T15:00:00.000Z');
+  assert.match(await scheduleClinicTask(1, '2000-01-01', '09:00'), /fecha y hora futuras/);
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  await webhook([answerButton('pending-dashboard', 'admin_tasks_0', admin)]);
+  assert.match(metaRequests.at(-1).interactive.body.text, /Pedir guantes[\s\S]*envío pendiente de activación/);
+  await webhook([textMessage('pending-detail', 'Pendiente #1', admin)]);
+  assert.match(metaRequests.at(-1).text.body, /Recuérdame el pendiente #1/);
+  await webhook([textMessage('pending-complete', 'Completar #1', admin)]);
+  assert.equal(clinicTasks.get(1).is_completed, true);
+  await webhook([textMessage('pending-empty', 'Pendientes', admin)]);
+  assert.match(metaRequests.at(-1).text.body, /No hay pendientes abiertos/);
+});
+
+test('concurrent cron runs send each due task just once and only to the administrator', async () => {
+  clinicTasks.clear();
+  process.env.CRON_SECRET = 'test-cron-secret';
+  delete process.env.WHATSAPP_TASK_REMINDER_TEMPLATE;
+  taskReminderTemplate = 'pendiente_clinica_recordatorio';
+  const due = new Date(Date.now() - 5_000).toISOString();
+  const future = new Date(Date.now() + 60_000).toISOString();
+  clinicTasks.set(1, { id: 1, is_completed: false, reminder_state: 'scheduled', reminder_at: due, description: 'Detalle privado' });
+  clinicTasks.set(2, { id: 2, is_completed: true, reminder_state: 'scheduled', reminder_at: due });
+  clinicTasks.set(3, { id: 3, is_completed: false, reminder_state: 'scheduled', reminder_at: future });
+  const before = metaRequests.length;
+  try {
+    const request = () => new Request('https://clinic.test/api/cron/reminders', { headers: { authorization: 'Bearer test-cron-secret' } });
+    const responses = await Promise.all([reminders(request()), reminders(request())]);
+    assert.deepEqual(responses.map(response => response.status), [200, 200]);
+    assert.equal(metaRequests.length, before + 1);
+    const message = metaRequests.at(-1);
+    assert.equal(message.to, process.env.ADMIN_PHONE_NUMBER);
+    assert.equal(message.template.name, taskReminderTemplate);
+    assert.deepEqual(message.template.components[0].parameters.map(param => param.text), ['1']);
+    assert.equal(clinicTasks.get(1).reminder_state, 'accepted');
+    assert.equal(clinicTasks.get(2).reminder_state, 'scheduled');
+    assert.equal(clinicTasks.get(3).reminder_state, 'scheduled');
+    await webhook([], true, '525500000099', [{ id: clinicTasks.get(1).reminder_message_id, status: 'delivered' }]);
+    assert.equal(clinicTasks.get(1).reminder_state, 'delivered');
+  } finally {
+    taskReminderTemplate = null;
   }
 });
 
