@@ -184,7 +184,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
 }
 
 const adminPrompts: Record<string, string> = {
-  admin_cancelar: 'Dime la fecha y el nombre o la hora. Por ejemplo, «Cancela la cita de Ana de mañana a las 4 p. m.».',
+  admin_cancelar: 'Dime la fecha y el nombre o la hora de la cita. Por ejemplo, «Corrige el WhatsApp de la cita de Ana de mañana a las 4 p. m.» o «Cancela la cita de hoy a las 5 p. m.».',
   admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
   adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',

@@ -253,38 +253,65 @@ export function moveCalendarAppointment(expected: CalendarEventData, ownerPhone:
   return updatePatientAppointment(expected, ownerPhone, newStart);
 }
 
-export async function cancelCalendarEvent(expected: CalendarEventData, ownerPhone?: string, correctedPhone?: string) {
-  const { calendar, calendarId } = getCalendarClient();
-  const eventId = expected.eventId;
-  const response = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
-  let current = toAppointment(response.data);
-  if (!current || Date.parse(current.start) <= Date.now() ||
+type CalendarClient = ReturnType<typeof getCalendarClient>;
+
+async function getEditableAppointment({ calendar, calendarId }: CalendarClient, expected: CalendarEventData, ownerPhone?: string) {
+  const { data } = await calendar.events.get({ calendarId, eventId: expected.eventId }, { timeout: 8_000 });
+  const current = toAppointment(data);
+  if (!current || current.eventId !== expected.eventId || Date.parse(current.start) <= Date.now() ||
       Date.parse(current.start) !== Date.parse(expected.start) || Date.parse(current.end) !== Date.parse(expected.end) ||
       current.summary !== expected.summary || current.patientPhone !== expected.patientPhone ||
       (ownerPhone && current.patientPhone !== ownerPhone)) {
     return null;
   }
-  let etag = response.data.etag;
-  if (!etag) throw new Error('Calendar no devolvió la versión de la cita');
-  if (correctedPhone) {
-    const description = withPatientPhone(response.data.description, correctedPhone);
-    await calendar.events.patch({ calendarId, eventId, sendUpdates: 'none', requestBody: {
+  if (!data.etag) throw new Error('Calendar no devolvió la versión de la cita');
+  return { event: current, data, etag: data.etag };
+}
+
+async function updateAppointmentContact(
+  { calendar, calendarId }: CalendarClient,
+  current: NonNullable<Awaited<ReturnType<typeof getEditableAppointment>>>,
+  correctedPhone: string,
+) {
+  const { event, data, etag } = current;
+  const eventId = event.eventId;
+  const description = withPatientPhone(data.description, correctedPhone);
+  const contactChanged = comparableWhatsApp(event.patientPhone) !== comparableWhatsApp(correctedPhone);
+  await calendar.events.patch({ calendarId, eventId, sendUpdates: 'none', requestBody: {
       visibility: 'private', description,
       extendedProperties: { private: {
-        ...response.data.extendedProperties?.private, patientPhone: correctedPhone, attendanceConfirmedFor: 'pending',
+        ...data.extendedProperties?.private, patientPhone: correctedPhone,
+        ...(contactChanged ? { attendanceConfirmedFor: 'pending' } : {}),
       } },
-    } }, { headers: { 'If-Match': etag }, timeout: 10_000 });
-    const { data: saved } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
-    current = toAppointment(saved);
-    if (!current || current.eventId !== eventId || current.summary !== expected.summary ||
-        !appointmentMatchesSlot(current, correctedPhone, expected) || saved.visibility !== 'private' ||
-        saved.description !== description || !saved.etag) {
-      throw new Error('Calendar no permitió verificar el WhatsApp corregido');
-    }
-    etag = saved.etag;
+  } }, { headers: { 'If-Match': etag }, timeout: 10_000 });
+  const { data: saved } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
+  const updated = toAppointment(saved);
+  if (!updated || updated.eventId !== eventId || updated.summary !== event.summary ||
+      !appointmentMatchesSlot(updated, correctedPhone, event) || saved.visibility !== 'private' ||
+      saved.description !== description || !saved.etag) {
+    throw new Error('Calendar no permitió verificar el WhatsApp corregido');
   }
-  await calendar.events.delete({ calendarId, eventId, sendUpdates: 'none' }, {
-    headers: { 'If-Match': etag }, timeout: 10_000,
+  return { event: updated, etag: saved.etag };
+}
+
+export async function saveCalendarAppointmentContact(expected: CalendarEventData, correctedPhone: string) {
+  const client = getCalendarClient();
+  try {
+    const current = await getEditableAppointment(client, expected);
+    return current ? (await updateAppointmentContact(client, current, correctedPhone)).event : null;
+  } catch (error) {
+    if ([404, 410, 412].includes(calendarErrorCode(error))) return null;
+    throw error;
+  }
+}
+
+export async function cancelCalendarEvent(expected: CalendarEventData, ownerPhone?: string, correctedPhone?: string) {
+  const client = getCalendarClient();
+  const current = await getEditableAppointment(client, expected, ownerPhone);
+  if (!current) return null;
+  const target = correctedPhone ? await updateAppointmentContact(client, current, correctedPhone) : current;
+  await client.calendar.events.delete({ calendarId: client.calendarId, eventId: expected.eventId, sendUpdates: 'none' }, {
+    headers: { 'If-Match': target.etag }, timeout: 10_000,
   });
-  return current;
+  return target.event;
 }

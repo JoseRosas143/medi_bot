@@ -46,7 +46,7 @@ export function showAdminMenu(to: string) {
     { title: 'Agenda y clínica', rows: [
       { id: 'admin_agenda', title: 'Agenda de hoy' },
       { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
-      { id: 'admin_cancelar', title: 'Cancelar cita' },
+      { id: 'admin_cancelar', title: 'Administrar cita', description: 'Corrige el WhatsApp o cancela' },
       { id: 'admin_task', title: 'Anotar pendiente' },
       { id: 'admin_tasks_0', title: 'Ver pendientes', description: 'Consulta tareas y sus recordatorios' },
       { id: 'admin_cerrar_chat', title: 'Cerrar chat directo' },

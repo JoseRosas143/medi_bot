@@ -32,7 +32,7 @@ const tools: ChatCompletionTool[] = [
     parameters: { type: 'object', properties: { date: { type: 'string', description: 'YYYY-MM-DD' } }, required: ['date'] },
   } },
   { type: 'function', function: {
-    name: 'find_cancellation', description: 'Busca cita futura por fecha, hora y/o paciente. Prepara un botón si hay una sola coincidencia.',
+    name: 'find_cancellation', description: 'Busca una cita futura por fecha, hora y/o paciente. Si hay una sola coincidencia, muestra opciones para corregir el WhatsApp o cancelar.',
     parameters: { type: 'object', properties: {
       date: { type: 'string', description: 'YYYY-MM-DD' }, patient: { type: 'string' },
       time: { type: 'string', description: 'Hora local HH:MM' },
@@ -116,7 +116,7 @@ export async function runAdminAgent(from: string, content: string) {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12_000, maxRetries: 0 });
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: `Eres Benson, el asistente operativo interno. En la clínica hoy es ${clinicDate()} y la hora local es ${formatAppointment(new Date().toISOString())}.
-Usa las herramientas para consultar agenda, preparar cancelaciones, gestionar tratamientos y FAQs y anotar, mostrar o completar pendientes. Solo modifica registros a petición explícita. Para programar un recordatorio, usa el día y la hora que pidió el administrador, interpretados en la zona horaria local. Si falta el día, la hora o el número de un pendiente existente, pide ese dato en un solo mensaje y no inventes valores. Si quiere ver la lista, usa list_tasks. Para cancelar una cita pide fecha y nombre u hora, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. El botón confirma la cancelación. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
+Usa las herramientas para consultar agenda, corregir el WhatsApp de una cita, preparar cancelaciones, gestionar tratamientos y FAQs y anotar, mostrar o completar pendientes. Solo modifica registros a petición explícita. Para programar un recordatorio, usa el día y la hora que pidió el administrador, interpretados en la zona horaria local. Si falta el día, la hora o el número de un pendiente existente, pide ese dato en un solo mensaje y no inventes valores. Si quiere ver la lista, usa list_tasks. Para corregir el WhatsApp de una cita o cancelarla, usa find_cancellation. Pide fecha y nombre u hora si faltan, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. La acción elegida en WhatsApp confirma el cambio. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
     { role: 'user', content },
   ];
   for (let turn = 0; turn < 4; turn++) {
