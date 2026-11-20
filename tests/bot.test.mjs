@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 
@@ -40,6 +40,8 @@ let taskReminderTemplate = null;
 const createdAppointments = [];
 let upcomingAppointments = [];
 const events = new Map();
+const pendingAppointmentActions = new Map();
+const patientNames = new Map();
 const calendarPatches = [];
 let busyPeriods = [];
 let persistCalendarWrites = true;
@@ -77,6 +79,10 @@ globalThis.testGoogle = {
         if (persistCalendarWrites) events.set(eventId, updated);
         return { data: updated };
       },
+      delete: async ({ eventId }, options) => {
+        assert.equal(options.headers['If-Match'], events.get(eventId).etag);
+        events.delete(eventId);
+      },
     },
   }),
 };
@@ -98,6 +104,7 @@ globalThis.testCalendar = {
   getPatientAppointments: liveCalendar.getPatientAppointments,
   getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
+  cancelCalendarEvent: liveCalendar.cancelCalendarEvent,
   appointmentMatchesSlot: liveCalendar.appointmentMatchesSlot,
   moveCalendarAppointment: liveCalendar.moveCalendarAppointment,
   confirmCalendarAttendance: liveCalendar.confirmCalendarAttendance,
@@ -131,7 +138,8 @@ function query(table) {
     lt: (field, value) => { constraints.push(row => row[field] != null && row[field] < value); return chain; },
     lte: (field, value) => { constraints.push(row => row[field] != null && row[field] <= value); return chain; },
     limit: value => { limit = value; return chain; },
-    match: () => chain, gt: () => chain, delete: () => chain,
+    match: () => chain, gt: (field, value) => { constraints.push(row => row[field] > value); return chain; }, delete: () => chain,
+    is: (field, value) => { filters[field] = value; return chain; },
     insert: value => { operation = 'insert'; values = value; return chain; },
     upsert: value => { operation = 'upsert'; values = value; return chain; },
     update: value => { operation = 'update'; values = value; return chain; },
@@ -175,6 +183,20 @@ function query(table) {
         }
         return resolve({ data: row || null, error: null });
       }
+      if (table === 'pending_appointment_actions') {
+        if (operation === 'insert') {
+          const id = randomUUID();
+          const row = { id, handled_at: null, expires_at: new Date(Date.now() + 900_000).toISOString(), ...values };
+          pendingAppointmentActions.set(id, row);
+          return resolve({ data: row, error: null });
+        }
+        const row = pendingAppointmentActions.get(filters.id);
+        if (!row || !Object.entries(filters).every(([key, value]) => row[key] === value) || !constraints.every(check => check(row))) {
+          return resolve({ data: null, error: null });
+        }
+        Object.assign(row, values);
+        return resolve({ data: row, error: null });
+      }
       if (table === 'whatsapp_receipts' && operation === 'insert') {
         if (receipts.has(values.message_id)) return resolve({ error: { code: '23505' } });
         receipts.add(values.message_id);
@@ -188,7 +210,10 @@ function query(table) {
         return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
       if (table === 'patients' && operation === 'select') {
-        return resolve({ data: { phone: filters.phone, full_name: 'Ana Demo', chat_mode: 'AI_ACTIVE', human_session_id: null } });
+        return resolve({ data: {
+          phone: filters.phone, full_name: patientNames.get(filters.phone) ?? 'Ana Demo',
+          chat_mode: 'AI_ACTIVE', human_session_id: null,
+        } });
       }
       if (table === 'chat_messages' && operation === 'insert') saved.push(values);
       if (table === 'treatments' && range) return resolve({ data: treatments.slice(range[0], range[1] + 1) });
@@ -210,6 +235,7 @@ const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts'
 const { clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
+const { proposeAppointmentAction } = await import('../src/lib/appointment-actions.ts');
 const { addClinicTask, scheduleClinicTask } = await import('../src/lib/clinic-tasks.ts');
 const { transcribeWhatsAppAudio } = await import('../src/lib/audio.ts');
 const patient = '525500000002';
@@ -300,6 +326,79 @@ function seedPatientAppointment() {
   events.set(event.id, event);
   return event;
 }
+
+test('admin cancellation suppresses a notice when the Calendar phone belongs to another profile', async () => {
+  const event = seedPatientAppointment();
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  process.env.WHATSAPP_CANCELLATION_TEMPLATE = 'cita_cancelada_clinica';
+  patientNames.set(patient, 'Otro Paciente');
+  const before = metaRequests.length;
+  try {
+    const details = await liveCalendar.getCalendarAppointment(event.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
+    assert.match(metaRequests.at(-1).interactive.body.text, /0002 sin verificar/);
+    const buttons = lastButtons();
+    assert.equal(buttons.some(id => id.startsWith('appointment_notify_')), false);
+    const only = buttons.find(id => id.startsWith('appointment_only_'));
+    await webhook([answerButton('legacy-cancel', only.replace('_only_', '_yes_'), admin)]);
+    assert.equal(events.has(event.id), true);
+    await webhook([answerButton('cancel-without-notice', only, admin)]);
+    assert.equal(events.has(event.id), false);
+    assert.match(metaRequests.at(-1).text.body, /sin enviar aviso/);
+    assert.ok(metaRequests.slice(before).every(message => message.to === admin && message.type !== 'template'));
+  } finally {
+    delete process.env.WHATSAPP_CANCELLATION_TEMPLATE;
+    patientNames.clear();
+    pendingAppointmentActions.clear();
+    events.clear();
+  }
+});
+
+test('admin cancellation sends one notice to the displayed number when the patient still matches', async () => {
+  const event = seedPatientAppointment();
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  process.env.WHATSAPP_CANCELLATION_TEMPLATE = 'cita_cancelada_clinica';
+  const before = metaRequests.length;
+  try {
+    const details = await liveCalendar.getCalendarAppointment(event.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
+    const confirmation = metaRequests.at(-1).interactive.body.text;
+    assert.match(confirmation, /WhatsApp del aviso •••• 0002/);
+    assert.equal(confirmation.includes(patient), false);
+    const notify = lastButtons().find(id => id.startsWith('appointment_notify_'));
+    await webhook([answerButton('cancel-and-notify', notify, admin), answerButton('cancel-and-notify-again', notify, admin)]);
+    assert.equal(events.has(event.id), false);
+    const templates = metaRequests.slice(before).filter(message => message.type === 'template');
+    assert.deepEqual(templates.map(message => [message.to, message.template.name]), [[patient, 'cita_cancelada_clinica']]);
+  } finally {
+    delete process.env.WHATSAPP_CANCELLATION_TEMPLATE;
+    pendingAppointmentActions.clear();
+    notices.clear();
+    events.clear();
+  }
+});
+
+test('admin cancellation checks the recipient again after the confirmation was offered', async () => {
+  const event = seedPatientAppointment();
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  process.env.WHATSAPP_CANCELLATION_TEMPLATE = 'cita_cancelada_clinica';
+  const before = metaRequests.length;
+  try {
+    const details = await liveCalendar.getCalendarAppointment(event.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
+    const notify = lastButtons().find(id => id.startsWith('appointment_notify_'));
+    patientNames.set(patient, 'Otro Paciente');
+    await webhook([answerButton('cancel-after-contact-changed', notify, admin)]);
+    assert.equal(events.has(event.id), false);
+    assert.match(metaRequests.at(-1).text.body, /El aviso no se envió/);
+    assert.ok(metaRequests.slice(before).every(message => message.to === admin && message.type !== 'template'));
+  } finally {
+    delete process.env.WHATSAPP_CANCELLATION_TEMPLATE;
+    patientNames.clear();
+    pendingAppointmentActions.clear();
+    events.clear();
+  }
+});
 
 test('a WhatsApp reminder reply confirms attendance for its owner and reception sees it', async () => {
   const event = seedPatientAppointment();
