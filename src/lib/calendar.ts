@@ -1,5 +1,5 @@
 import { google, type calendar_v3 } from 'googleapis';
-import { clinicDate, clinicInstant, CLINIC_TIMEZONE, formatAppointment } from '@/lib/clinic-time';
+import { clinicDate, clinicInstant, CLINIC_TIMEZONE, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp';
 
 const APPOINTMENT_MINUTES = 45;
@@ -42,26 +42,45 @@ async function getBusySlots(start: string, end: string) {
   return result.busy || [];
 }
 
-export async function getAvailableSlots(date: string) {
+function workingHours(date: string) {
   const opening = clinicInstant(date, process.env.CLINIC_OPEN_TIME || '09:00');
   const closing = clinicInstant(date, process.env.CLINIC_CLOSE_TIME || '19:00');
-  const duration = APPOINTMENT_MINUTES * 60_000;
   if (closing.getTime() <= opening.getTime()) throw new Error('Horario de clínica inválido');
-  if (closing.getTime() <= Date.now()) return { date, slots: [] };
+  return { opening, closing };
+}
 
-  const busy = await getBusySlots(opening.toISOString(), closing.toISOString());
+function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$TimePeriod[], after: number) {
+  const duration = APPOINTMENT_MINUTES * 60_000;
   const slots = [];
   for (let start = opening.getTime(); start + duration <= closing.getTime(); start += 15 * 60_000) {
     const end = start + duration;
-    if (start <= Date.now() || busy.some(slot => start < Date.parse(slot.end || '') && end > Date.parse(slot.start || ''))) continue;
+    if (start <= after || busy.some(slot => start < Date.parse(slot.end || '') && end > Date.parse(slot.start || ''))) continue;
     const iso = new Date(start).toISOString();
     slots.push({ start: iso, end: new Date(end).toISOString(), label: formatAppointment(iso) });
   }
-  return { date, slots };
+  return slots;
+}
+
+export async function getAvailableSlots(date: string) {
+  const { opening, closing } = workingHours(date);
+  const now = Date.now();
+  if (closing.getTime() <= now) return { date, slots: [] };
+  const busy = await getBusySlots(opening.toISOString(), closing.toISOString());
+  return { date, slots: availableSlots(opening, closing, busy, now) };
+}
+
+export async function getUpcomingSlots(after = Date.now()) {
+  const earliest = Math.max(after, Date.now());
+  const days = [];
+  for (let date = clinicDate(new Date(earliest)), index = 0; index < 14; index++, date = nextDate(date)) {
+    days.push(workingHours(date));
+  }
+  const busy = await getBusySlots(days[0].opening.toISOString(), days[days.length - 1].closing.toISOString());
+  return days.flatMap(({ opening, closing }) => availableSlots(opening, closing, busy, earliest));
 }
 
 export async function createCalendarAppointment(params: {
-  actionId: string; patientName: string; patientPhone: string; startTime: string; isUrgent?: boolean;
+  actionId: string; patientName: string; patientPhone: string; startTime: string; reason: string;
 }) {
   const { calendar, calendarId } = getCalendarClient();
   const start = new Date(params.startTime);
@@ -73,7 +92,9 @@ export async function createCalendarAppointment(params: {
     calendarId,
     requestBody: {
       id: params.actionId.replaceAll('-', ''),
-      summary: `${params.isUrgent ? '[URGENTE] ' : ''}Cita: ${params.patientName}`,
+      summary: `Cita: ${params.patientName}`,
+      visibility: 'private',
+      description: `Motivo o tratamiento indicado por el paciente: ${params.reason}`,
       start: { dateTime: slot.start, timeZone: CLINIC_TIMEZONE },
       end: { dateTime: slot.end, timeZone: CLINIC_TIMEZONE },
       extendedProperties: { private: { patientPhone: params.patientPhone } },
@@ -81,6 +102,19 @@ export async function createCalendarAppointment(params: {
   }, { timeout: 10_000 });
   if (!event.data.id) throw new Error('Calendar no devolvió el identificador de la cita');
   return slot;
+}
+
+export async function findCalendarBooking(actionId: string) {
+  const { calendar, calendarId } = getCalendarClient();
+  try {
+    const { data } = await calendar.events.get({ calendarId, eventId: actionId.replaceAll('-', '') }, { timeout: 8_000 });
+    return toAppointment(data);
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && [404, 410].includes(Number(error.code))) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 async function listAppointments(options: calendar_v3.Params$Resource$Events$List): Promise<CalendarEventData[]> {

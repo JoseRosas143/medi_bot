@@ -30,6 +30,7 @@ const tools: ChatCompletionTool[] = [
     parameters: { type: 'object', properties: {
       catalog: { type: 'string', enum: ['treatments', 'faqs'] }, action: { type: 'string', enum: ['list', 'add', 'update', 'delete'] },
       label: { type: 'string' }, new_label: { type: 'string' }, price: { type: 'number' }, answer: { type: 'string' },
+      description: { type: 'string', description: 'Descripción del tratamiento para la ficha, proporcionada por la clínica.' },
     }, required: ['catalog', 'action'] },
   } },
   { type: 'function', function: {
@@ -38,7 +39,7 @@ const tools: ChatCompletionTool[] = [
   } },
 ];
 
-type CatalogRequest = { catalog: Catalog; action: string; label?: string; new_label?: string; price?: number; answer?: string };
+type CatalogRequest = { catalog: Catalog; action: string; label?: string; new_label?: string; price?: number; answer?: string; description?: string };
 
 async function manageCatalog(args: CatalogRequest) {
   const { catalog, action } = args;
@@ -53,11 +54,13 @@ async function manageCatalog(args: CatalogRequest) {
   if (!label || label.length > 250) return 'Especifica el nombre o la pregunta.';
   const priceValid = typeof args.price === 'number' && Number.isFinite(args.price) && args.price >= 0;
   const answer = args.answer?.trim();
+  const description = args.description?.trim();
+  if (treatments && description && description.length > 600) return 'Escribe una descripción de hasta 600 caracteres.';
   const newLabel = args.new_label?.trim();
   if (action === 'add') {
     if (treatments && !priceValid) return 'Indica un precio válido en MXN.';
     if (!treatments && !answer) return 'Indica la respuesta de la pregunta.';
-    const values: Record<string, unknown> = treatments ? { name: label, price: args.price } : { question: label, answer };
+    const values: Record<string, unknown> = treatments ? { name: label, price: args.price, description: description || null } : { question: label, answer };
     const existing = await findCatalogEntries(catalog, label);
     if (existing.some(item => normalized(item.label) === normalized(label))) return 'Ya existe una opción activa con ese nombre.';
     await db.from(catalog).insert(values).throwOnError();
@@ -71,6 +74,7 @@ async function manageCatalog(args: CatalogRequest) {
   else {
     if (newLabel && newLabel.length <= 250) changes[field] = newLabel;
     if (treatments && priceValid) changes.price = args.price;
+    if (treatments && description) changes.description = description;
     if (!treatments && answer) changes.answer = answer;
   }
   if (!Object.keys(changes).length) return 'Faltan datos válidos para el cambio.';

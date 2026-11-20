@@ -38,3 +38,5 @@ npm.cmd run build
 ```
 
 Con números de prueba, escribe «Hola», completa el nombre, abre Tratamientos y Preguntas frecuentes, y envía una nota de voz. Desde el número administrador, escribe «Ayuda», revisa la agenda y responde citando el aviso de atención humana. Reserva una cita de prueba para mañana y comprueba el recordatorio, la cancelación con el botón y el aviso al paciente. Comprueba el estado del aviso en Supabase.
+
+Desde «Agendar cita», una ficha de tratamiento o «Crear cita» en administración, Benson ofrece hasta dos horarios de Google Calendar. Después de elegir una hora, confirma el nombre completo y el motivo o tratamiento. Administración también captura el WhatsApp del paciente. Una confirmación corresponde a una sola versión de la reserva. El motivo breve se guarda en las notas de un evento privado en Calendar.
