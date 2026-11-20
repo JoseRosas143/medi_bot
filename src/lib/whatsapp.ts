@@ -23,6 +23,18 @@ export function isWhatsAppPhone(value: string): boolean {
   return /^[1-9]\d{7,14}$/.test(value);
 }
 
+export function parseClinicWhatsApp(value: string): string | null {
+  const input = value.trim();
+  if (!/^\+?[\d\s()-]+$/.test(input)) return null;
+  const digits = phoneDigits(input);
+  const phone = !input.startsWith('+') && /^\d{10}$/.test(digits) ? `52${digits}` : digits;
+  return isWhatsAppPhone(phone) ? phone : null;
+}
+
+export function comparableWhatsApp(phone: string): string {
+  return phone.replace(/^521(?=\d{10}$)/, '52');
+}
+
 export function shorten(value: string, limit: number): string {
   const text = value.trim();
   if (text.length <= limit) return text;

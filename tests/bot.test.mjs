@@ -7,7 +7,7 @@ const databaseUrl = 'data:text/javascript,export const supabaseAdmin=globalThis.
 const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogle';
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
-    cancelCalendarEvent, getPatientAppointments, getAppointmentsByDateRange, appointmentPatientName,
+    cancelCalendarEvent, getPatientAppointments, findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, appointmentPatientName,
     getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot } = globalThis.testCalendar;
 `);
 registerHooks({
@@ -102,6 +102,7 @@ globalThis.testCalendar = {
     return calendarSlots.find(slot => slot.start === params.startTime);
   },
   getPatientAppointments: liveCalendar.getPatientAppointments,
+  findUpcomingAppointmentsByWhatsApp: liveCalendar.findUpcomingAppointmentsByWhatsApp,
   getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
   cancelCalendarEvent: liveCalendar.cancelCalendarEvent,
@@ -190,11 +191,14 @@ function query(table) {
           pendingAppointmentActions.set(id, row);
           return resolve({ data: row, error: null });
         }
-        const row = pendingAppointmentActions.get(filters.id);
-        if (!row || !Object.entries(filters).every(([key, value]) => row[key] === value) || !constraints.every(check => check(row))) {
+        const row = [...pendingAppointmentActions.values()].find(row =>
+          Object.entries(filters).every(([key, value]) =>
+            (key === 'details->>contactPromptId' ? row.details.contactPromptId : row[key]) === value) &&
+          constraints.every(check => check(row)));
+        if (!row) {
           return resolve({ data: null, error: null });
         }
-        Object.assign(row, values);
+        if (operation === 'update') Object.assign(row, values);
         return resolve({ data: row, error: null });
       }
       if (table === 'whatsapp_receipts' && operation === 'insert') {
@@ -400,6 +404,63 @@ test('admin cancellation checks the recipient again after the confirmation was o
   }
 });
 
+test('admin corrects the Calendar contact before cancelling and sends the notice only to the confirmed number', async () => {
+  const event = seedPatientAppointment();
+  event.description += `\nWhatsApp del paciente: +${patient}`;
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const corrected = '522210000033';
+  const before = metaRequests.length;
+  process.env.WHATSAPP_CANCELLATION_TEMPLATE = 'cita_cancelada_clinica';
+  patientNames.set(patient, 'Otro Paciente');
+  try {
+    const details = await liveCalendar.getCalendarAppointment(event.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details });
+    await webhook([answerButton('edit-cancel-phone', lastButtons().find(id => id.startsWith('appointment_contact_')), admin)]);
+    const promptId = `mock_${metaRequests.length}`;
+    const reply = (id, value) => ({ ...textMessage(id, value, admin), context: { id: promptId } });
+    await webhook([reply('reception-phone', '+52 1 5500000001')]);
+    assert.match(metaRequests.at(-1).text.body, /número de recepción/);
+    await webhook([reply('valid-cancel-phone', '221 000 0033')]);
+    assert.match(metaRequests.at(-1).interactive.body.text, new RegExp(corrected));
+    assert.equal(events.get(event.id).extendedProperties.private.patientPhone, patient);
+    assert.ok(metaRequests.slice(before).every(message => message.to === admin));
+    const confirmation = lastButtons().find(id => id.startsWith('appointment_corrected_'));
+    await webhook([answerButton('confirm-new-number', confirmation, admin), answerButton('repeat-quoted-confirmation', confirmation, admin)]);
+    assert.equal(events.has(event.id), false);
+    const update = calendarPatches.at(-1);
+    assert.equal(update.eventId, event.id);
+    assert.equal(update.requestBody.visibility, 'private');
+    assert.equal(update.requestBody.description, `Motivo original\nWhatsApp del paciente: +${corrected}`);
+    assert.equal(update.requestBody.extendedProperties.private.patientPhone, corrected);
+    assert.equal(update.requestBody.extendedProperties.private.clinicMetadata, 'original');
+    assert.deepEqual(metaRequests.slice(before).filter(message => message.type === 'template')
+      .map(message => message.to), [corrected]);
+  } finally {
+    delete process.env.WHATSAPP_CANCELLATION_TEMPLATE;
+    patientNames.clear();
+    pendingAppointmentActions.clear();
+    notices.clear();
+    events.clear();
+  }
+});
+
+test('admin can look up upcoming appointments using either WhatsApp format for Mexico', async () => {
+  const event = seedPatientAppointment();
+  event.extendedProperties.private.patientPhone = '5215500000002';
+  try {
+    const admin = process.env.ADMIN_PHONE_NUMBER;
+    await webhook([textMessage('lookup-admin-citas', 'Buscar cita por WhatsApp 55 0000 0002', admin)]);
+    const reply = metaRequests.at(-1);
+    assert.equal(reply.to, admin);
+    assert.match(reply.text.body, /WhatsApp •••• 0002/);
+    assert.match(reply.text.body, /Ana Demo/);
+    await webhook([textMessage('lookup-other-number', 'Buscar cita por WhatsApp +52 55 0000 0003', admin)]);
+    assert.match(metaRequests.at(-1).text.body, /Sin citas futuras/);
+  } finally {
+    events.clear();
+  }
+});
+
 test('a WhatsApp reminder reply confirms attendance for its owner and reception sees it', async () => {
   const event = seedPatientAppointment();
   const reminderId = 'test-reminder';
@@ -515,6 +576,7 @@ test('an accepted Calendar write does not confirm until the saved appointment is
     persistCalendarWrites = true;
     assert.equal((await liveCalendar.createCalendarAppointment(booking)).start, startTime);
     assert.equal(events.get('testbooking').transparency, 'opaque');
+    assert.match(events.get('testbooking').description, new RegExp(`WhatsApp del paciente: \\+${patient}$`));
   } finally {
     persistCalendarWrites = true;
     events.clear();

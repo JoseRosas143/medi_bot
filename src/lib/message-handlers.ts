@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
-import { handleAppointmentAction } from '@/lib/appointment-actions';
+import { handleAppointmentAction, handleCancellationContactReply } from '@/lib/appointment-actions';
 import { handleBooking, startBooking } from '@/lib/booking';
 import { handlePatientAppointments, showPatientAppointments } from '@/lib/patient-appointments';
 import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
-import { runAdminAgent, showSchedule } from '@/lib/handlers/adminHandler';
+import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
@@ -231,6 +231,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
       return;
     }
   }
+  if (contextMessageId && !optionId && await handleCancellationContactReply(from, contextMessageId, content)) return;
   if (await handleAppointmentAction(from, optionId, true)) return;
   if (optionId === 'admin_panel') return showAdminMenu(from);
   const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
@@ -238,6 +239,8 @@ export async function handleAdminMessage(message: IncomingMessage) {
     return showPendingTasks(from, Number(taskPage?.[1] || 0));
   }
   if (!optionId) {
+    const byPhone = content.trim().match(/^buscar citas? por whatsapp(?:\s+(.+))?$/i);
+    if (byPhone) return showAppointmentsByWhatsApp(from, byPhone[1] || '');
     const detail = text.match(/^(?:ver )?pendiente\s+#?(\d{1,10})$/);
     if (detail) return void await showClinicTask(from, Number(detail[1]));
     const completed = text.match(/^(?:completar|completa) (?:pendiente\s+)?#?(\d{1,10})$/);
