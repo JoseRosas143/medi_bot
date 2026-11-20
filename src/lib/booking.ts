@@ -3,6 +3,7 @@ import { supabaseAdmin as db } from '@/lib/supabase';
 import { bookWithLock, withCalendarLock } from '@/lib/appointment-actions';
 import { appointmentMatchesSlot, findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
 import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
+import { formatVisitLocation } from '@/lib/clinic-visit';
 import { normalized } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -230,7 +231,12 @@ async function showConfirmation(draft: Draft) {
 
 async function markConfirmed(draft: Draft) {
   const updated = await replaceDraft(draft, 'confirmed', { selected: draft.details.selected });
-  if (updated) await sendWhatsAppText(draft.actor_phone, `✅ *${draft.details.original ? 'Cita reagendada' : 'Cita confirmada'}*\n${formatSlot(draft.details.selected!)}${draft.details.original ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : ''}`);
+  if (!updated) return;
+  const moved = Boolean(draft.details.original);
+  const status = moved ? 'Cita reagendada' : 'Cita confirmada';
+  const attendance = moved ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : '';
+  const location = draft.details.patientPhone === draft.actor_phone ? `\n\n${formatVisitLocation()}` : '';
+  await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(draft.details.selected!)}${attendance}${location}`);
 }
 
 async function finishUnchanged(draft: Draft, message: string) {

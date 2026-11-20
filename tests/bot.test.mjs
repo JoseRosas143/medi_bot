@@ -655,6 +655,7 @@ test('rescheduling patches only the existing Calendar event and resets stale att
   const patches = calendarPatches.length;
   try {
     await webhook([textMessage('move-mis-citas', 'Mis citas')]);
+    assert.ok(metaRequests.at(-1).interactive.body.text.includes('https://maps.app.goo.gl/15xyVp2bi89p6Lrs5?g_st=ac'));
     const oldMove = lastButtons().find(id => id.startsWith('appt_move_'));
     await webhook([answerButton('move-options', oldMove)]);
     await webhook([answerButton('pick-reschedule', lastButtons()[0])]);
@@ -764,6 +765,7 @@ test('a clinic echo, delivery status, or stale reply cannot reopen the menu', as
 });
 
 test('a time change invalidates the previous confirmation and creates only the selected appointment', async () => {
+  const before = metaRequests.length;
   await webhook([answerButton('book-from-treatment', 'book_trt_3')]);
   assert.equal(lastButtons().length, 3);
   assert.match(metaRequests.at(-1).interactive.body.text, /16:00[\s\S]*17:00/);
@@ -785,6 +787,8 @@ test('a time change invalidates the previous confirmation and creates only the s
   assert.equal(createdAppointments.length, 1);
   assert.equal(createdAppointments[0].startTime, calendarSlots[1].start);
   assert.equal(createdAppointments[0].reason, treatments[2].name);
+  const confirmed = metaRequests.slice(before).find(message => message.text?.body.includes('*Cita confirmada*'));
+  assert.ok(confirmed.text.body.includes('https://maps.app.goo.gl/15xyVp2bi89p6Lrs5?g_st=ac'));
 });
 
 test('the admin books for the patient and confirms name, contact, and reason', async () => {
@@ -798,7 +802,9 @@ test('the admin books for the patient and confirms name, contact, and reason', a
   await webhook([textMessage('admin-reason', 'Valoración dental', admin)]);
   assert.match(metaRequests.at(-1).interactive.body.text, /Sofía Ramírez/);
   assert.match(metaRequests.at(-1).interactive.body.text, /Valoración dental/);
+  const before = metaRequests.length;
   await webhook([answerButton('admin-confirm', lastButtons()[0], admin)]);
+  assert.ok(metaRequests.slice(before).every(message => message.to === admin && !message.text?.body.includes('maps.app.goo.gl')));
   assert.equal(createdAppointments.at(-1).patientPhone, '525512345678');
   assert.equal(createdAppointments.at(-1).patientName, 'Sofía Ramírez');
 });
