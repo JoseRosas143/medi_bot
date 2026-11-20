@@ -4,6 +4,7 @@ import { supabaseAdmin as db } from '@/lib/supabase';
 import { getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
 import { clinicDate, clinicDayRange, formatAppointment } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
+import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { findCatalogEntries, normalized, showAdminMenu, type Catalog } from '@/lib/menus';
 import { sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -34,8 +35,25 @@ const tools: ChatCompletionTool[] = [
     }, required: ['catalog', 'action'] },
   } },
   { type: 'function', function: {
-    name: 'add_task', description: 'Anota un pendiente interno solicitado por el administrador.',
-    parameters: { type: 'object', properties: { description: { type: 'string' } }, required: ['description'] },
+    name: 'add_task', description: 'Anota un pendiente interno nuevo, con recordatorio si fue pedido. La fecha y la hora son de la clínica.',
+    parameters: { type: 'object', properties: {
+      description: { type: 'string' }, reminder_requested: { type: 'boolean' },
+      date: { type: 'string', description: 'YYYY-MM-DD' }, time: { type: 'string', description: 'HH:MM, 24 horas' },
+    }, required: ['description', 'reminder_requested'] },
+  } },
+  { type: 'function', function: {
+    name: 'schedule_task_reminder', description: 'Programa o cambia el recordatorio de un pendiente abierto cuando el administrador proporciona su número, fecha y hora.',
+    parameters: { type: 'object', properties: {
+      id: { type: 'integer' }, date: { type: 'string', description: 'YYYY-MM-DD' }, time: { type: 'string', description: 'HH:MM, 24 horas' },
+    }, required: ['id', 'date', 'time'] },
+  } },
+  { type: 'function', function: {
+    name: 'list_tasks', description: 'Muestra pendientes abiertos y sus recordatorios.',
+    parameters: { type: 'object', properties: {} },
+  } },
+  { type: 'function', function: {
+    name: 'complete_task', description: 'Marca un pendiente como completado únicamente cuando el administrador pide cerrarlo e indica el número.',
+    parameters: { type: 'object', properties: { id: { type: 'integer' } }, required: ['id'] },
   } },
 ];
 
@@ -85,8 +103,8 @@ async function manageCatalog(args: CatalogRequest) {
 export async function runAdminAgent(from: string, content: string) {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12_000, maxRetries: 0 });
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: `Eres Benson, el asistente operativo interno. En la clínica hoy es ${clinicDate()}.
-Usa las herramientas para consultar agenda, preparar cancelaciones, gestionar tratamientos y FAQs y anotar pendientes. Solo modifica registros a petición explícita. Para cancelar pide fecha y nombre u hora, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. El botón confirma la cancelación. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
+    { role: 'system', content: `Eres Benson, el asistente operativo interno. En la clínica hoy es ${clinicDate()} y la hora local es ${formatAppointment(new Date().toISOString())}.
+Usa las herramientas para consultar agenda, preparar cancelaciones, gestionar tratamientos y FAQs y anotar, mostrar o completar pendientes. Solo modifica registros a petición explícita. Para programar un recordatorio, usa el día y la hora que pidió el administrador, interpretados en la zona horaria local. Si falta el día, la hora o el número de un pendiente existente, pide ese dato en un solo mensaje y no inventes valores. Si quiere ver la lista, usa list_tasks. Para cancelar una cita pide fecha y nombre u hora, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. El botón confirma la cancelación. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
     { role: 'user', content },
   ];
   for (let turn = 0; turn < 4; turn++) {
@@ -131,14 +149,10 @@ Usa las herramientas para consultar agenda, preparar cancelaciones, gestionar tr
         }
       }
       if (name === 'manage_catalog') result = await manageCatalog(args);
-      if (name === 'add_task') {
-        const description = typeof args.description === 'string' ? args.description.trim() : '';
-        if (!description || description.length > 1500) result = 'Indica el pendiente en un mensaje breve.';
-        else {
-          await db.from('clinic_tasks').insert({ description }).throwOnError();
-          result = 'Pendiente guardado.';
-        }
-      }
+      if (name === 'list_tasks') return showPendingTasks(from);
+      if (name === 'add_task') return void await sendWhatsAppText(from, await addClinicTask(args));
+      if (name === 'schedule_task_reminder') return void await sendWhatsAppText(from, await scheduleClinicTask(args.id, args.date, args.time));
+      if (name === 'complete_task') return void await sendWhatsAppText(from, await completeClinicTask(args.id));
       messages.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify(result) });
     }
   }

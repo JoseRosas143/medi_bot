@@ -48,6 +48,7 @@ export function showAdminMenu(to: string) {
       { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
       { id: 'admin_cancelar', title: 'Cancelar cita' },
       { id: 'admin_task', title: 'Anotar pendiente' },
+      { id: 'admin_tasks_0', title: 'Ver pendientes', description: 'Consulta tareas y sus recordatorios' },
       { id: 'admin_cerrar_chat', title: 'Cerrar chat directo' },
     ] },
     { title: 'Catálogo', rows: [

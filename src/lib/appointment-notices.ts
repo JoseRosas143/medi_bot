@@ -1,6 +1,7 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { appointmentPatientName, type CalendarEventData } from '@/lib/calendar';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
+import { recordTaskReminderStatus } from '@/lib/clinic-tasks';
 import { sendWhatsAppTemplate, WhatsAppError } from '@/lib/whatsapp';
 
 export async function sendAppointmentNotice(appointment: CalendarEventData, kind: 'reminder' | 'cancellation') {
@@ -32,7 +33,8 @@ export async function sendAppointmentNotice(appointment: CalendarEventData, kind
 
 export async function recordNoticeStatus(id: string, status: string) {
   if (status !== 'failed' && status !== 'delivered' && status !== 'read') return;
-  await db.from('appointment_notices').update({
+  const { data } = await db.from('appointment_notices').update({
     state: status === 'failed' ? 'failed' : 'delivered', updated_at: new Date().toISOString(),
-  }).eq('wa_message_id', id).in('state', ['accepted', 'uncertain']).throwOnError();
+  }).eq('wa_message_id', id).in('state', ['accepted', 'uncertain']).select('event_id').maybeSingle().throwOnError();
+  if (!data) await recordTaskReminderStatus(id, status);
 }

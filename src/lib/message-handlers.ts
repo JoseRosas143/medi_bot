@@ -4,6 +4,7 @@ import { getPatientAppointments } from '@/lib/calendar';
 import { clinicName, formatAppointment } from '@/lib/clinic-time';
 import { handleAppointmentAction } from '@/lib/appointment-actions';
 import { handleBooking, startBooking } from '@/lib/booking';
+import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { runAdminAgent, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
@@ -188,7 +189,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
 
 const adminPrompts: Record<string, string> = {
   admin_cancelar: 'Dime la fecha y el nombre o la hora. Por ejemplo, «Cancela la cita de Ana de mañana a las 4 p. m.».',
-  admin_task: 'Escribe «Anota como pendiente» y lo que hay que hacer.',
+  admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
   adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',
   adm_edit_treatment: 'Indica el tratamiento y qué quieres cambiar: descripción, precio, nombre o visibilidad.',
@@ -235,6 +236,17 @@ export async function handleAdminMessage(message: IncomingMessage) {
     }
   }
   if (await handleAppointmentAction(from, optionId, true)) return;
+  if (optionId === 'admin_panel') return showAdminMenu(from);
+  const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
+  if (taskPage || (!optionId && /^(?:ver |lista de |mis )?pendientes$/.test(text))) {
+    return showPendingTasks(from, Number(taskPage?.[1] || 0));
+  }
+  if (!optionId) {
+    const detail = text.match(/^(?:ver )?pendiente\s+#?(\d{1,10})$/);
+    if (detail) return void await showClinicTask(from, Number(detail[1]));
+    const completed = text.match(/^(?:completar|completa) (?:pendiente\s+)?#?(\d{1,10})$/);
+    if (completed) return void await sendWhatsAppText(from, await completeClinicTask(Number(completed[1])));
+  }
   if (optionId === 'admin_booking' || (!optionId && ['crear cita', 'agendar cita', 'reservar cita'].includes(text))) {
     return startBooking(from, true);
   }

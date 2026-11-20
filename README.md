@@ -29,6 +29,17 @@ node --env-file=.env.local scripts/meta-templates.mjs --submit
 
 Supabase registra el resultado de cada intento en `appointment_notices`. Una solicitud aceptada por Meta es distinta de una entrega, que se registra al recibir la confirmación por webhook. Los intentos con resultado incierto requieren cotejo en Meta antes de reenviar.
 
+## Pendientes y recordatorios internos
+
+Desde el número administrador, abre **Ayuda → Ver pendientes** o escribe **Pendientes**. El panel muestra los pendientes abiertos y sus avisos. Escribe «Pendiente #42» para ver el detalle o «Completar #42» para cerrarlo.
+
+- Para crear con aviso, escribe «Anota pedir guantes y recuérdamelo mañana a las 9:00».
+- Para uno existente, escribe «Recuérdame el pendiente #42 mañana a las 9:00».
+
+Aplica la migración `clinic_task_reminders` antes de desplegar. Para solicitar la plantilla de utilidad sin enviar un mensaje de WhatsApp, ejecuta `node --env-file=.env.local scripts/meta-templates.mjs --clinic-tasks --submit`. Una vez aprobada, guarda `pendiente_clinica_recordatorio` en `bot_settings.task_reminder_template` para el registro `id = 1` y despliega. También se puede configurar desde `WHATSAPP_TASK_REMINDER_TEMPLATE` en Vercel, que tiene prioridad. La lista y el registro de horarios funcionan mientras la plantilla se revisa.
+
+El cron existente de cron-job.org revisa los avisos cada hora. El mensaje se envía al número administrador y solo incluye el número de pendiente. El detalle queda disponible al abrir «Pendientes».
+
 ## Verificación
 
 ```powershell

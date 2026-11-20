@@ -4,7 +4,13 @@ if (!WHATSAPP_TOKEN || !/^\d+$/.test(WHATSAPP_WABA_ID || '')) {
   process.exit(1);
 }
 
-const templates = [
+const templates = process.argv.includes('--clinic-tasks') ? [
+  {
+    name: 'pendiente_clinica_recordatorio',
+    text: 'Tienes un recordatorio para el pendiente interno número {{1}}. Responde Pendientes para ver tus tareas abiertas.',
+    examples: ['42'],
+  },
+] : [
   {
     name: 'cita_recordatorio',
     text: 'Hola, {{1}}. {{2}} te recuerda que tienes una cita el {{3}}. Si necesitas cambiarla, responde a este mensaje.',
