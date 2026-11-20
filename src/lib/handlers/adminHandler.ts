@@ -2,16 +2,31 @@ import OpenAI from 'openai';
 import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
-import { clinicDate, clinicDayRange, formatAppointment } from '@/lib/clinic-time';
+import { clinicDate, clinicDayRange, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
 import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { findCatalogEntries, normalized, showAdminMenu, type Catalog } from '@/lib/menus';
-import { parseClinicWhatsApp, sendWhatsAppText } from '@/lib/whatsapp';
+import { visitStatusLabel } from '@/lib/reception';
+import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
 export async function showSchedule(phone: string, date = clinicDate(), events?: CalendarEventData[]) {
   const appointments = events ?? await getAppointmentsByDateRange(...clinicDayRange(date));
-  const lines = appointments.slice(0, 25).map(event => `• ${formatAppointment(event.start)} — ${event.summary}${event.patientPhone ? event.attendanceConfirmed ? ' · Asistencia confirmada' : ' · Asistencia pendiente' : ''}`);
-  await sendWhatsAppText(phone, `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}\n\nPara buscar por número, escribe «Buscar cita por WhatsApp» y el número completo.`);
+  const lines = appointments.slice(0, 25).map(event => {
+    const state = event.visitStatus ? visitStatusLabel(event.visitStatus)
+      : event.patientPhone ? event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente' : '';
+    return `• ${formatAppointment(event.start)} — ${event.summary}${state ? ` · ${state}` : ''}`;
+  });
+  const text = `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}\n\nPara buscar por número, escribe «Buscar cita por WhatsApp» y el número completo.`;
+  const today = clinicDate();
+  if (text.length > 1024) await sendWhatsAppText(phone, text);
+  await sendWhatsAppInteractiveButtons({
+    to: phone, bodyText: text.length > 1024 ? 'Opciones de agenda' : text,
+    buttons: [
+      date === today ? { id: 'rec_visits_0', title: 'Registrar visita' } : { id: 'admin_agenda', title: 'Agenda de hoy' },
+      ...(date !== nextDate(today) ? [{ id: 'rec_tomorrow', title: 'Mañana' }] : []),
+      { id: 'admin_panel', title: 'Panel' },
+    ],
+  });
 }
 
 export async function showAppointmentsByWhatsApp(admin: string, input: string) {

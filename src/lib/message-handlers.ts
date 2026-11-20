@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { clinicName, formatAppointment } from '@/lib/clinic-time';
+import { clinicDate, clinicName, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { handleAppointmentAction, handleCancellationContactReply } from '@/lib/appointment-actions';
 import { handleBooking, startBooking } from '@/lib/booking';
 import { handlePatientAppointments, showPatientAppointments } from '@/lib/patient-appointments';
 import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
+import { handleReceptionAction } from '@/lib/reception';
 import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
@@ -251,6 +252,8 @@ export async function handleAdminMessage(message: IncomingMessage) {
   }
   if (!optionId && menuRequests.has(text)) return showAdminMenu(from);
   if (optionId === 'admin_agenda' || text === 'agenda de hoy') return showSchedule(from);
+  if (optionId === 'rec_tomorrow' || (!optionId && text === 'agenda de manana')) return showSchedule(from, nextDate(clinicDate()));
+  if (await handleReceptionAction(from, optionId)) return;
   if (optionId && Object.hasOwn(adminPrompts, optionId)) {
     await sendWhatsAppText(from, adminPrompts[optionId]);
     return;

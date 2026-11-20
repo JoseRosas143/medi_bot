@@ -4,6 +4,8 @@ import { comparableWhatsApp, isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp
 
 const APPOINTMENT_MINUTES = 45;
 
+export type VisitStatus = 'arrived' | 'no_show';
+
 export interface CalendarEventData {
   eventId: string;
   summary: string;
@@ -11,6 +13,7 @@ export interface CalendarEventData {
   end: string;
   patientPhone: string;
   attendanceConfirmed?: boolean;
+  visitStatus?: VisitStatus;
 }
 
 function getCalendarClient() {
@@ -36,10 +39,14 @@ function withPatientPhone(description: string | null | undefined, phone: string)
 function toAppointment(event: calendar_v3.Schema$Event): CalendarEventData | null {
   const { id, start, end, summary, status } = event;
   if (status === 'cancelled' || !id || !start?.dateTime || !end?.dateTime) return null;
-  const confirmedFor = event.extendedProperties?.private?.attendanceConfirmedFor;
+  const metadata = event.extendedProperties?.private;
+  const confirmedFor = metadata?.attendanceConfirmedFor;
+  const result = metadata?.visitStatus;
   return {
     eventId: id, summary: summary || 'Cita', start: start.dateTime, end: end.dateTime, patientPhone: eventContact(event),
     attendanceConfirmed: Boolean(confirmedFor && Date.parse(confirmedFor) === Date.parse(start.dateTime)),
+    visitStatus: (result === 'arrived' || result === 'no_show') &&
+      Date.parse(metadata?.visitStatusFor || '') === Date.parse(start.dateTime) ? result : undefined,
   };
 }
 
@@ -251,6 +258,31 @@ export function confirmCalendarAttendance(expected: CalendarEventData, ownerPhon
 
 export function moveCalendarAppointment(expected: CalendarEventData, ownerPhone: string, newStart: string) {
   return updatePatientAppointment(expected, ownerPhone, newStart);
+}
+
+export async function recordCalendarVisit(expected: CalendarEventData, status: VisitStatus) {
+  const { calendar, calendarId } = getCalendarClient();
+  const eventId = expected.eventId;
+  try {
+    const { data } = await calendar.events.get({ calendarId, eventId }, { timeout: 8_000 });
+    const current = toAppointment(data);
+    if (!current || current.eventId !== eventId || !data.etag ||
+        current.visitStatus !== expected.visitStatus || current.summary !== expected.summary ||
+        current.patientPhone !== expected.patientPhone || Date.parse(current.start) !== Date.parse(expected.start) ||
+        Date.parse(current.end) !== Date.parse(expected.end) || clinicDate(new Date(current.start)) !== clinicDate()) return 'changed';
+    if (status === 'no_show' && Date.parse(current.start) > Date.now()) return 'too_early';
+    if (current.visitStatus === status) return 'saved';
+    await calendar.events.patch({ calendarId, eventId, sendUpdates: 'none', requestBody: {
+      extendedProperties: { private: {
+        ...data.extendedProperties?.private, visitStatus: status, visitStatusFor: new Date(current.start).toISOString(),
+      } },
+    } }, { headers: { 'If-Match': data.etag }, timeout: 10_000 });
+    const saved = await getCalendarAppointment(eventId);
+    return saved?.visitStatus === status && Date.parse(saved.start) === Date.parse(current.start) ? 'saved' : 'changed';
+  } catch (error) {
+    if ([404, 410, 412].includes(calendarErrorCode(error))) return 'changed';
+    throw error;
+  }
 }
 
 type CalendarClient = ReturnType<typeof getCalendarClient>;
