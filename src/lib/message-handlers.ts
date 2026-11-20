@@ -7,6 +7,7 @@ import { handlePatientAppointments, showPatientAppointments } from '@/lib/patien
 import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
 import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
+import { handleTreatmentEditor } from '@/lib/treatment-editor';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
@@ -188,7 +189,6 @@ const adminPrompts: Record<string, string> = {
   admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
   adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',
-  adm_edit_treatment: 'Indica el tratamiento y qué quieres cambiar: descripción, precio, nombre o visibilidad.',
   adm_add_faq: 'Escribe la pregunta y su respuesta en el mismo mensaje.',
   adm_edit_faq: 'Escribe la pregunta y la nueva respuesta, o indica que quieres retirarla.',
 };
@@ -233,6 +233,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
   }
   if (contextMessageId && !optionId && await handleCancellationContactReply(from, contextMessageId, content)) return;
   if (await handleAppointmentAction(from, optionId, true)) return;
+  if (await handleTreatmentEditor(from, optionId, content, contextMessageId)) return;
   if (optionId === 'admin_panel') return showAdminMenu(from);
   const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
   if (taskPage || (!optionId && /^(?:ver |lista de |mis )?pendientes$/.test(text))) {
