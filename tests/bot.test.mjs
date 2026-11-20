@@ -8,7 +8,7 @@ const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogl
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
     cancelCalendarEvent, getPatientAppointments, getAppointmentsByDateRange, appointmentPatientName,
-    getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance } = globalThis.testCalendar;
+    getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot } = globalThis.testCalendar;
 `);
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -42,6 +42,7 @@ let upcomingAppointments = [];
 const events = new Map();
 const calendarPatches = [];
 let busyPeriods = [];
+let persistCalendarWrites = true;
 const mockCalendarId = 'test-calendar';
 process.env.GOOGLE_CALENDAR_ID = mockCalendarId;
 process.env.GOOGLE_PRIVATE_KEY = 'test-google-key';
@@ -55,16 +56,25 @@ globalThis.testGoogle = {
         if (!events.has(eventId)) throw Object.assign(new Error('Missing event'), { code: 404 });
         return { data: structuredClone(events.get(eventId)) };
       },
-      list: async ({ privateExtendedProperty }) => ({
-        data: { items: [...events.values()].filter(event => !privateExtendedProperty ||
-          privateExtendedProperty.includes(`patientPhone=${event.extendedProperties.private.patientPhone}`)) },
+      list: async ({ privateExtendedProperty, timeMin, timeMax, eventTypes }) => ({
+        data: { items: [...events.values()].filter(event =>
+          (!privateExtendedProperty || privateExtendedProperty.includes(`patientPhone=${event.extendedProperties?.private?.patientPhone}`)) &&
+          (!eventTypes || (
+            eventTypes.includes(event.eventType || 'default') &&
+            Date.parse(event.end.dateTime) > Date.parse(timeMin) &&
+            Date.parse(event.start.dateTime) < Date.parse(timeMax)
+          ))) },
       }),
+      insert: async ({ requestBody }) => {
+        if (persistCalendarWrites) events.set(requestBody.id, requestBody);
+        return { data: requestBody };
+      },
       patch: async ({ eventId, requestBody }, options) => {
         const event = events.get(eventId);
         assert.equal(options.headers['If-Match'], event.etag);
         calendarPatches.push({ eventId, requestBody });
         const updated = { ...event, ...requestBody, etag: `v${calendarPatches.length + 1}` };
-        events.set(eventId, updated);
+        if (persistCalendarWrites) events.set(eventId, updated);
         return { data: updated };
       },
     },
@@ -77,7 +87,9 @@ const calendarSlots = ['16:00', '17:00', '18:00'].map(hour => ({
   label: `Viernes a las ${hour}`,
 }));
 globalThis.testCalendar = {
-  getUpcomingSlots: async () => calendarSlots,
+  getUpcomingSlots: async (_after, duration) => duration ? calendarSlots.map(slot => ({
+    ...slot, end: new Date(Date.parse(slot.start) + duration).toISOString(),
+  })) : calendarSlots,
   getAvailableSlots: async date => ({ date, slots: calendarSlots }),
   createCalendarAppointment: async params => {
     createdAppointments.push(params);
@@ -86,6 +98,7 @@ globalThis.testCalendar = {
   getPatientAppointments: liveCalendar.getPatientAppointments,
   getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
+  appointmentMatchesSlot: liveCalendar.appointmentMatchesSlot,
   moveCalendarAppointment: liveCalendar.moveCalendarAppointment,
   confirmCalendarAttendance: liveCalendar.confirmCalendarAttendance,
   appointmentPatientName: summary => summary.replace(/^Cita: /, ''),
@@ -362,6 +375,49 @@ test('if the new slot becomes busy, the existing appointment keeps its original 
   } finally {
     busyPeriods = [];
     bookingDrafts.delete(patient);
+    events.clear();
+  }
+});
+
+test('availability excludes patient appointments marked free and allows adjacent slots', async () => {
+  const date = '2099-11-20';
+  events.set('occupied', {
+    start: { dateTime: `${date}T10:30:00-06:00` }, end: { dateTime: `${date}T11:15:00-06:00` },
+    transparency: 'transparent', extendedProperties: { private: { patientPhone: patient } },
+  });
+  events.set('unrelated-free-event', {
+    start: { dateTime: `${date}T12:15:00-06:00` }, end: { dateTime: `${date}T13:00:00-06:00` },
+    transparency: 'transparent',
+  });
+  try {
+    const { slots } = await liveCalendar.getAvailableSlots(date);
+    const startsAt = time => slots.some(slot => Date.parse(slot.start) === Date.parse(`${date}T${time}:00-06:00`));
+    assert.equal(startsAt('10:15'), false);
+    assert.equal(startsAt('10:30'), false);
+    assert.equal(startsAt('11:15'), true);
+    assert.equal(startsAt('12:15'), true);
+  } finally {
+    events.clear();
+  }
+});
+
+test('an accepted Calendar write does not confirm until the saved appointment is readable', async () => {
+  const event = seedPatientAppointment();
+  const startTime = '2099-11-20T23:00:00.000Z';
+  const booking = { actionId: 'test-booking', patientName: 'Ana Demo', patientPhone: patient, startTime, reason: 'Consulta' };
+  const original = await liveCalendar.getCalendarAppointment(event.id);
+  try {
+    persistCalendarWrites = false;
+    await assert.rejects(liveCalendar.createCalendarAppointment(booking), /verificar la cita guardada/);
+    await assert.rejects(liveCalendar.moveCalendarAppointment(original, patient, startTime), /verificar la cita guardada/);
+    await assert.rejects(liveCalendar.confirmCalendarAttendance(original, patient), /verificar la cita guardada/);
+    assert.equal(events.size, 1);
+    assert.equal(events.get(event.id).start.dateTime, event.start.dateTime);
+    persistCalendarWrites = true;
+    assert.equal((await liveCalendar.createCalendarAppointment(booking)).start, startTime);
+    assert.equal(events.get('testbooking').transparency, 'opaque');
+  } finally {
+    persistCalendarWrites = true;
     events.clear();
   }
 });

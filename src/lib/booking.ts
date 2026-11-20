@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { bookWithLock, withCalendarLock } from '@/lib/appointment-actions';
-import { findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
+import { appointmentMatchesSlot, findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
 import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { normalized } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
@@ -53,6 +53,13 @@ const shortSlot = new Intl.DateTimeFormat('es-MX', {
 const localTime = new Intl.DateTimeFormat('en-GB', {
   timeZone: CLINIC_TIMEZONE, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
+const slotRange = new Intl.DateTimeFormat('es-MX', {
+  timeZone: CLINIC_TIMEZONE, dateStyle: 'full', timeStyle: 'short', hourCycle: 'h23',
+});
+
+function formatSlot(slot: Slot) {
+  return slotRange.formatRange(new Date(slot.start), new Date(slot.end));
+}
 
 function requestedSchedule(text: string, tentativeDate: string): Preference | null {
   const standard = normalized(text).replace(/[¿?]/g, '');
@@ -122,7 +129,7 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
   }
   await sendWhatsAppInteractiveButtons({
     to: phone,
-    bodyText: `🗓️ *Horarios disponibles*\n${original ? `Cita actual: ${formatAppointment(original.start)}\n` : ''}${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${slot.label}`).join('\n')}`,
+    bodyText: `🗓️ *Horarios disponibles*\n${original ? `Cita actual: ${formatAppointment(original.start)}\n` : ''}${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${formatSlot(slot)}`).join('\n')}`,
     buttons: [
       ...options.map((slot, index) => ({ id: buttonId(updated, String(index)), title: shortSlot.format(new Date(slot.start)) })),
       { id: buttonId(updated, 'more'), title: 'Ver otros horarios' },
@@ -202,7 +209,7 @@ async function showConfirmation(draft: Draft) {
   const { selected, patientName, patientPhone, reason, original } = draft.details;
   if (original && selected) return sendWhatsAppInteractiveButtons({
     to: draft.actor_phone,
-    bodyText: `*Confirma el cambio de horario*\nCita actual: ${formatAppointment(original.start)}\nNuevo horario: ${selected.label}`,
+    bodyText: `*Confirma el cambio de horario*\nCita actual: ${formatAppointment(original.start)}\nNuevo horario: ${formatSlot(selected)}`,
     buttons: [
       { id: buttonId(draft, 'confirm'), title: 'Confirmar cambio' },
       { id: buttonId(draft, 'more'), title: 'Ver otros horarios' },
@@ -212,7 +219,7 @@ async function showConfirmation(draft: Draft) {
   if (!selected || !patientName || !patientPhone || !reason) return stale(draft.actor_phone);
   return sendWhatsAppInteractiveButtons({
     to: draft.actor_phone,
-    bodyText: `*Confirma los datos de la cita*\n🗓️ ${selected.label}\n👤 ${patientName}\n📝 ${reason}${patientPhone !== draft.actor_phone ? `\nWhatsApp: +${patientPhone}` : ''}\n\nAl confirmar se guardará el motivo en las notas de Calendar.`,
+    bodyText: `*Confirma los datos de la cita*\n🗓️ ${formatSlot(selected)}\n👤 ${patientName}\n📝 ${reason}${patientPhone !== draft.actor_phone ? `\nWhatsApp: +${patientPhone}` : ''}\n\nAl confirmar se guardará el motivo en las notas de Calendar.`,
     buttons: [
       { id: buttonId(draft, 'confirm'), title: 'Confirmar cita' },
       { id: buttonId(draft, 'more'), title: 'Cambiar horario' },
@@ -223,7 +230,7 @@ async function showConfirmation(draft: Draft) {
 
 async function markConfirmed(draft: Draft) {
   const updated = await replaceDraft(draft, 'confirmed', { selected: draft.details.selected });
-  if (updated) await sendWhatsAppText(draft.actor_phone, `✅ *${draft.details.original ? 'Cita reagendada' : 'Cita confirmada'}*\n${draft.details.selected!.label}${draft.details.original ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : ''}`);
+  if (updated) await sendWhatsAppText(draft.actor_phone, `✅ *${draft.details.original ? 'Cita reagendada' : 'Cita confirmada'}*\n${formatSlot(draft.details.selected!)}${draft.details.original ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : ''}`);
 }
 
 async function finishUnchanged(draft: Draft, message: string) {
@@ -237,7 +244,7 @@ async function checkProcessing(draft: Draft) {
   if (current(draft)) return sendWhatsAppText(phone, 'La agenda está confirmando tu cita. Espera la respuesta antes de iniciar otra.');
   const original = draft.details.original;
   const event = original ? await getCalendarAppointment(original.eventId) : await findCalendarBooking(draft.id);
-  if (event && event.patientPhone === draft.details.patientPhone && Date.parse(event.start) === Date.parse(draft.details.selected?.start || '')) {
+  if (appointmentMatchesSlot(event, draft.details.patientPhone, draft.details.selected)) {
     return markConfirmed(draft);
   }
   if (original && (!event || event.patientPhone !== phone || Date.parse(event.start) !== Date.parse(original.start))) {
