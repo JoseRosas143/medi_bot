@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { bookWithLock, withCalendarLock } from '@/lib/appointment-actions';
+import { bookWithLock } from '@/lib/appointment-actions';
+import { dispatchAdminBookingNotice, queueAdminBookingNotice } from '@/lib/admin-booking-notices';
+import { withCalendarLock } from '@/lib/calendar-lock';
 import { appointmentMatchesSlot, findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
 import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
+import { offerReleasedAppointment } from '@/lib/waitlist';
 import { normalized } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -230,13 +233,23 @@ async function showConfirmation(draft: Draft) {
 }
 
 async function markConfirmed(draft: Draft) {
+  const { original, selected, patientPhone } = draft.details;
+  if (!selected) return;
+  const bookingId = draft.id.replaceAll('-', '');
+  const alertAdmin = !original && patientPhone === draft.actor_phone;
+  if (alertAdmin) await queueAdminBookingNotice(bookingId, selected.start).catch(() => console.error('Could not queue booking notice'));
   const updated = await replaceDraft(draft, 'confirmed', { selected: draft.details.selected });
   if (!updated) return;
-  const moved = Boolean(draft.details.original);
+  const moved = Boolean(original);
   const status = moved ? 'Cita reagendada' : 'Cita confirmada';
   const attendance = moved ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : '';
   const location = draft.details.patientPhone === draft.actor_phone ? `\n\n${formatVisitLocation()}` : '';
-  await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(draft.details.selected!)}${attendance}${location}`);
+  try {
+    await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(selected)}${attendance}${location}`);
+  } finally {
+    if (alertAdmin) await dispatchAdminBookingNotice(bookingId, selected.start).catch(() => console.error('Could not dispatch booking notice'));
+    if (original) await offerReleasedAppointment(original).catch(() => console.error('Could not process released appointment'));
+  }
 }
 
 async function finishUnchanged(draft: Draft, message: string) {

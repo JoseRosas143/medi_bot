@@ -9,6 +9,7 @@ import { handleReceptionAction } from '@/lib/reception';
 import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { handleTreatmentEditor } from '@/lib/treatment-editor';
+import { handleWaitlistOffer } from '@/lib/waitlist';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
@@ -99,6 +100,8 @@ export async function handlePatientMessage(message: IncomingMessage) {
     await reply('Si tienes dificultad para respirar, dolor de pecho, pérdida del conocimiento o un sangrado que no se detiene, llama a emergencias o acude a urgencias de inmediato.');
     return;
   }
+
+  if (await handleWaitlistOffer(from, optionId)) return;
 
   if (patient.chat_mode === 'WAITING_HUMAN') {
     if (!optionId && closeRequests.has(text)) {

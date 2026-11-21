@@ -4,6 +4,8 @@ import { getAppointmentsByDateRange } from '@/lib/calendar';
 import { reminderWindow } from '@/lib/clinic-time';
 import { sendAppointmentNotice } from '@/lib/appointment-notices';
 import { runClinicTaskReminders } from '@/lib/clinic-tasks';
+import { runAdminBookingNotices } from '@/lib/admin-booking-notices';
+import { runWaitlist } from '@/lib/waitlist';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -16,12 +18,12 @@ export async function GET(request: Request) {
     return new NextResponse('No autorizado', { status: 401 });
   }
 
-  const [appointments, tasks] = await Promise.allSettled([
-    runAppointmentReminders(), runClinicTaskReminders(),
+  const [appointments, tasks, waitlist, bookings] = await Promise.allSettled([
+    runAppointmentReminders(), runClinicTaskReminders(), runWaitlist(), runAdminBookingNotices(),
   ]);
   const taskReminders = tasks.status === 'fulfilled' ? tasks.value : { enabled: true, counts: { error: 1 } };
-  if (appointments.status === 'rejected' || tasks.status === 'rejected') {
-    console.error('Reminder run failed', { appointments: appointments.status, tasks: tasks.status });
+  if ([appointments, tasks, waitlist, bookings].some(result => result.status === 'rejected')) {
+    console.error('Scheduled work failed', { appointments: appointments.status, tasks: tasks.status, waitlist: waitlist.status, bookings: bookings.status });
   }
   if (appointments.status === 'rejected') {
     return NextResponse.json({ success: false, task_reminders: taskReminders }, { status: 500 });
@@ -29,7 +31,8 @@ export async function GET(request: Request) {
   const { counts } = appointments.value;
   const taskCounts: Record<string, number> = taskReminders.counts;
   const success = !counts.rejected && !counts.uncertain && !counts.error && !counts.not_configured
-    && !taskCounts.rejected && !taskCounts.uncertain && !taskCounts.error;
+    && !taskCounts.rejected && !taskCounts.uncertain && !taskCounts.error
+    && waitlist.status === 'fulfilled' && bookings.status === 'fulfilled';
   return NextResponse.json({
     success, ...appointments.value, task_reminders: taskReminders,
   }, { status: success ? 200 : 502 });
