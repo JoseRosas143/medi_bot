@@ -72,7 +72,7 @@ export function sendWhatsAppText(to: string, body: string): Promise<string> {
   return sendWhatsAppRequest(to, { type: 'text', text: { body: shorten(body, 4096) } });
 }
 
-export function sendWhatsAppTemplate(to: string, name: string, values: string[]): Promise<string> {
+export function sendWhatsAppTemplate(to: string, name: string, values: string[], replies: string[] = []): Promise<string> {
   return sendWhatsAppRequest(to, {
     type: 'template',
     template: {
@@ -81,9 +81,17 @@ export function sendWhatsAppTemplate(to: string, name: string, values: string[])
       components: [{
         type: 'body',
         parameters: values.map(value => ({ type: 'text', text: value.replace(/\s+/g, ' ').trim() })),
-      }],
+      }, ...replies.map((payload, index) => ({
+        type: 'button', sub_type: 'quick_reply', index: String(index),
+        parameters: [{ type: 'payload', payload }],
+      }))],
     },
   });
+}
+
+export function hasWhatsAppWindow(lastInbound: string | null | undefined) {
+  const elapsed = Date.now() - Date.parse(lastInbound || '');
+  return elapsed >= 0 && elapsed < 86_400_000;
 }
 
 export function sendWhatsAppInteractiveList(params: {

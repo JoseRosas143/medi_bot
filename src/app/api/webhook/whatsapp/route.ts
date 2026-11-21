@@ -13,6 +13,7 @@ type Reply = { id?: string; title?: string };
 type WhatsAppMessage = {
   id: string; from: string; timestamp?: string; type: string;
   context?: { id?: string }; text?: { body?: string }; audio?: { id?: string };
+  button?: { payload?: string; text?: string };
   interactive?: { list_reply?: Reply; button_reply?: Reply };
 };
 type WhatsAppPayload = {
@@ -44,8 +45,10 @@ async function processMessage(message: WhatsAppMessage, displayNumber?: string) 
   if (normalizedNumber(message.from) === normalizedNumber(displayNumber)) return;
   const sentAt = Number(message.timestamp) * 1000;
   if (Number.isFinite(sentAt) && sentAt > 0 && Date.now() - sentAt >= 86_400_000) return;
-  const reply = message.interactive?.list_reply || message.interactive?.button_reply;
-  const text = message.type === 'text' ? message.text?.body : message.type === 'interactive' ? reply?.title : undefined;
+  const reply = message.type === 'button'
+    ? { id: message.button?.payload, title: message.button?.text }
+    : message.interactive?.list_reply || message.interactive?.button_reply;
+  const text = message.type === 'text' ? message.text?.body : reply?.title;
   const mediaId = message.type === 'audio' ? message.audio?.id : undefined;
   if (!text?.trim() && !mediaId && !reply?.id) return;
   const { error } = await db.from('whatsapp_receipts').insert({ message_id: message.id });

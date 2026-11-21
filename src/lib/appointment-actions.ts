@@ -1,7 +1,9 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { cancelCalendarEvent, createCalendarAppointment, saveCalendarAppointmentContact, type CalendarEventData } from '@/lib/calendar';
+import { withCalendarLock } from '@/lib/calendar-lock';
 import { formatAppointment } from '@/lib/clinic-time';
 import { hasVerifiedCancellationContact, isPatientNoticeDestination, sendAppointmentNotice } from '@/lib/appointment-notices';
+import { offerReleasedAppointment } from '@/lib/waitlist';
 import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, shorten } from '@/lib/whatsapp';
 
 type Cancellation = {
@@ -89,26 +91,6 @@ export async function handleCancellationContactReply(phone: string, promptId: st
   return true;
 }
 
-export async function withCalendarLock<T>(id: string, change: () => Promise<T>) {
-  const now = new Date();
-  const lock = { id: 1, holder: id, expires_at: new Date(now.getTime() + 120_000).toISOString() };
-  const { error } = await db.from('calendar_booking_lock').insert(lock);
-  if (error?.code === '23505') {
-    const { data } = await db.from('calendar_booking_lock').update(lock).eq('id', 1)
-      .lt('expires_at', now.toISOString()).select('id').maybeSingle().throwOnError();
-    if (!data) return { state: 'busy' } as const;
-  } else if (error) {
-    throw error;
-  }
-
-  try {
-    return await change();
-  } finally {
-    const { error: releaseError } = await db.from('calendar_booking_lock').delete().eq('id', 1).eq('holder', id);
-    if (releaseError) console.error('Could not release booking lock');
-  }
-}
-
 export function bookWithLock(booking: Parameters<typeof createCalendarAppointment>[0]) {
   return withCalendarLock(booking.actionId, async () => {
     const slot = await createCalendarAppointment(booking);
@@ -178,6 +160,10 @@ export async function handleAppointmentAction(phone: string, optionId: string | 
       reply += '\nSe canceló sin enviar aviso por WhatsApp.';
     }
   }
-  await sendWhatsAppText(phone, reply);
+  try {
+    await sendWhatsAppText(phone, reply);
+  } finally {
+    if (cancelled) await offerReleasedAppointment(cancelled).catch(() => console.error('Could not process released appointment'));
+  }
   return true;
 }

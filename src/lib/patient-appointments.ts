@@ -6,6 +6,7 @@ import { CLINIC_TIMEZONE, formatAppointment } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
 import { normalized } from '@/lib/menus';
 import { supabaseAdmin as db } from '@/lib/supabase';
+import { changeWaitlistEnrollment, showWaitlistRequest } from '@/lib/waitlist';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, shorten } from '@/lib/whatsapp';
 
 const pageSize = 8;
@@ -19,15 +20,16 @@ function appointmentCode(event: CalendarEventData) {
 
 function showAppointment(phone: string, event: CalendarEventData) {
   const id = appointmentCode(event);
-  return sendWhatsAppInteractiveButtons({
-    to: phone,
-    bodyText: `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}\n\n${formatVisitLocation()}`,
-    buttons: [
+  const bodyText = `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}\n\n${formatVisitLocation()}`;
+  const buttons = [
       ...(!event.attendanceConfirmed ? [{ id: `appt_attend_${id}`, title: 'Confirmar asistencia' }] : []),
       { id: `appt_move_${id}`, title: 'Cambiar horario' },
+      { id: `appt_wait_${id}`, title: 'Lista de espera' },
       { id: `appt_cancel_${id}`, title: 'Cancelar cita' },
-    ],
-  });
+  ];
+  return buttons.length <= 3
+    ? sendWhatsAppInteractiveButtons({ to: phone, bodyText, buttons })
+    : sendWhatsAppInteractiveList({ to: phone, bodyText, buttonText: 'Ver opciones', sections: [{ title: 'Tu cita', rows: buttons }] });
 }
 
 export async function showPatientAppointments(phone: string, page = 0) {
@@ -73,16 +75,18 @@ async function actOnAppointment(phone: string, event: CalendarEventData, action:
 export async function handlePatientAppointments(phone: string, content: string, option?: string, contextId?: string) {
   const text = normalized(content).replace(/^[¡¿]+/, '');
   const page = option?.match(/^appt_page_(\d{1,5})$/);
-  if (page || option === 'cancelar' || (!option && text === 'mis citas')) {
+  if (page || option === 'cancelar' || (!option && /^(?:mis citas|lista de espera|adelantar (?:mi|la) cita)$/.test(text))) {
     await showPatientAppointments(phone, Number(page?.[1] || 0));
     return true;
   }
 
-  const button = option?.match(/^appt_(view|attend|move|cancel)_([\da-f]{32})$/);
+  const button = option?.match(/^appt_(view|attend|move|cancel|wait|wait_join|wait_leave)_([\da-f]{32})$/);
   if (button) {
     const event = (await getPatientAppointments(phone)).find(item => appointmentCode(item) === button[2]);
-    if (event) await actOnAppointment(phone, event, button[1] as Action);
-    else await sendWhatsAppText(phone, 'Ese horario cambió o ya pasó. Abre «Mis citas» para ver tu agenda actual.');
+    if (!event) await sendWhatsAppText(phone, 'Ese horario cambió o ya pasó. Abre «Mis citas» para ver tu agenda actual.');
+    else if (button[1] === 'wait') await showWaitlistRequest(phone, event, button[2]);
+    else if (button[1] === 'wait_join' || button[1] === 'wait_leave') await changeWaitlistEnrollment(phone, event, button[1] === 'wait_join');
+    else await actOnAppointment(phone, event, button[1] as Action);
     return true;
   }
   if (option) return false;

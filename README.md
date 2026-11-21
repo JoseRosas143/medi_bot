@@ -40,6 +40,14 @@ Aplica la migración `clinic_task_reminders` antes de desplegar. Para solicitar 
 
 El cron existente de cron-job.org revisa los avisos cada hora. El mensaje se envía al número administrador y solo incluye el número de pendiente. El detalle queda disponible al abrir «Pendientes».
 
+## Lista de espera y avisos de citas nuevas
+
+Desde **Mis citas → Lista de espera → Pedir adelantar**, el paciente solicita un espacio anterior para la misma cita. Benson ofrece cada hueco al primer paciente elegible por orden de solicitud. La oferta vence después de 30 minutos o cuando empieza la cita, lo que ocurra primero. Si el paciente acepta, Benson verifica disponibilidad y mueve el evento existente. El cron retoma las ofertas vencidas y detecta cancelaciones o cambios de citas que ya observó en Calendar durante los próximos 14 días.
+
+Las reservas nuevas hechas por pacientes generan un aviso a recepción. Si la cita es para el día en curso, el aviso indica **Para hoy**. Las reservas hechas por recepción se confirman en el propio chat de administración.
+
+Aplica la migración `appointment_waitlist` antes de desplegar. Consulta las plantillas con `node --env-file=.env.local scripts/meta-templates.mjs --booking-alerts` y agrega `--submit` para solicitar aprobación. Una vez aprobadas, registra `cita_adelanto_lista_espera` en `bot_settings.waitlist_template` y `cita_nueva_recepcion` en `bot_settings.admin_booking_template`, ambas en el registro `id = 1`. Las variables de Vercel `WHATSAPP_WAITLIST_TEMPLATE` y `WHATSAPP_ADMIN_BOOKING_TEMPLATE` tienen prioridad. Mientras se revisan, Benson puede enviar estos avisos a destinatarios con una ventana de WhatsApp abierta.
+
 ## Verificación
 
 ```powershell

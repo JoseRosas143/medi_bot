@@ -37,6 +37,11 @@ const reminderReplies = new Map();
 const saved = [];
 const bookingDrafts = new Map();
 const treatmentDrafts = new Map();
+const waitEntries = new Map();
+const waitOpenings = new Map();
+const bookingNotices = new Map();
+const lastInbounds = new Map();
+let adminLastInbound = null;
 const clinicTasks = new Map();
 let taskReminderTemplate = null;
 const createdAppointments = [];
@@ -128,10 +133,11 @@ function query(table) {
   let singleRow = false;
   let limit;
   let sort;
+  const sorts = [];
   let range;
   const chain = {
     select: () => chain,
-    order: (field, options) => { sort = { field, ascending: options?.ascending !== false }; return chain; },
+    order: (field, options) => { sort = { field, ascending: options?.ascending !== false }; sorts.push(sort); return chain; },
     maybeSingle: () => { singleRow = true; return chain; },
     single: () => { singleRow = true; return chain; },
     or: rule => {
@@ -140,10 +146,15 @@ function query(table) {
     },
     eq: (field, value) => { filters[field] = value; return chain; },
     in: (field, choices) => { constraints.push(row => choices.includes(row[field])); return chain; },
-    lt: (field, value) => { constraints.push(row => row[field] != null && row[field] < value); return chain; },
-    lte: (field, value) => { constraints.push(row => row[field] != null && row[field] <= value); return chain; },
+    lt: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) < value); return chain; },
+    lte: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) <= value); return chain; },
+    not: (field, _operator, value) => {
+      constraints.push(row => !value.slice(1, -1).split(',').includes(readField(row, field)));
+      return chain;
+    },
     limit: value => { limit = value; return chain; },
-    match: () => chain, gt: (field, value) => { constraints.push(row => row[field] > value); return chain; },
+    match: values => { Object.assign(filters, values); return chain; },
+    gt: (field, value) => { constraints.push(row => readField(row, field) > value); return chain; },
     delete: () => { operation = 'delete'; return chain; },
     is: (field, value) => { filters[field] = value; return chain; },
     insert: value => { operation = 'insert'; values = value; return chain; },
@@ -153,7 +164,42 @@ function query(table) {
     throwOnError: () => chain,
     then: resolve => {
       if (table === 'bot_settings' && operation === 'select') {
-        return resolve({ data: { task_reminder_template: taskReminderTemplate }, error: null });
+        return resolve({ data: { task_reminder_template: taskReminderTemplate, admin_last_inbound_at: adminLastInbound }, error: null });
+      }
+      if (table === 'appointment_waitlist' || table === 'waitlist_openings') {
+        const isEntry = table === 'appointment_waitlist';
+        const storage = isEntry ? waitEntries : waitOpenings;
+        if (operation === 'insert') {
+          if (isEntry && storage.has(values.event_id) || !isEntry &&
+              [...storage.values()].some(row => row.start_at === values.start_at && row.state !== 'closed')) {
+            return resolve({ data: null, error: { code: '23505' } });
+          }
+          const row = isEntry ? { ...values } : {
+            id: randomUUID(), revision: randomUUID(), state: 'open', attempted_ids: [], deadline: null, checked_at: '', ...values,
+          };
+          storage.set(isEntry ? values.event_id : row.id, row);
+          return resolve({ data: { ...row }, error: null });
+        }
+        let rows = [...storage.entries()].map(([key, row]) => [key, isEntry ? {
+          ...row, duration_seconds: (Date.parse(row.original_end) - Date.parse(row.original_start)) / 1000,
+          patients: { chat_mode: 'AI_ACTIVE', last_inbound_at: lastInbounds.get(row.phone) ?? new Date(Date.now() - 1000).toISOString() },
+        } : { ...row }]).filter(([, row]) =>
+          Object.entries(filters).every(([field, value]) => readField(row, field) === value) && constraints.every(check => check(row)));
+        for (const { field, ascending } of [...sorts].reverse()) rows.sort(([, a], [, b]) =>
+          (a[field] > b[field] ? 1 : a[field] < b[field] ? -1 : 0) * (ascending ? 1 : -1));
+        if (limit) rows = rows.slice(0, limit);
+        if (operation === 'update') {
+          if (!isEntry && values.state === 'offered' && [...storage.values()].some(row =>
+            row.id !== filters.id && row.candidate_phone === values.candidate_phone && ['offered', 'processing'].includes(row.state))) {
+            return resolve({ data: null, error: { code: '23505' } });
+          }
+          for (const [key, row] of rows) {
+            Object.assign(row, values);
+            Object.assign(storage.get(key), values);
+          }
+        }
+        if (operation === 'delete') rows.forEach(([key]) => storage.delete(key));
+        return resolve({ data: singleRow ? rows[0]?.[1] ?? null : rows.map(([, row]) => row), error: null });
       }
       if (table === 'clinic_tasks') {
         if (operation === 'insert') {
@@ -227,6 +273,16 @@ function query(table) {
         if (notices.has(key)) return resolve({ error: { code: '23505' } });
         notices.add(key);
       }
+      if (table === 'appointment_notices' && (values?.kind === 'booking_admin' || filters.kind === 'booking_admin')) {
+        if (operation === 'upsert') {
+          if (!bookingNotices.has(values.event_id)) bookingNotices.set(values.event_id, { ...values });
+          return resolve({ data: null, error: null });
+        }
+        const rows = [...bookingNotices.values()].filter(row =>
+          Object.entries(filters).every(([field, value]) => row[field] === value) && constraints.every(check => check(row)));
+        if (operation === 'update') rows.forEach(row => Object.assign(row, values));
+        return resolve({ data: singleRow ? rows[0] ?? null : rows.slice(0, limit), error: null });
+      }
       if (table === 'appointment_notices' && operation === 'select') {
         return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
@@ -249,7 +305,8 @@ function query(table) {
   };
   return chain;
 }
-globalThis.testDatabase = { from: query };
+const readField = (row, field) => field.split('.').reduce((value, part) => value?.[part], row);
+globalThis.testDatabase = { from: query, rpc: () => ({ throwOnError: async () => ({ error: null }) }) };
 globalThis.fetch = async (url, options) => {
   assert.match(String(url), /^https:\/\/graph\.facebook\.com\//);
   metaRequests.push(JSON.parse(options.body));
@@ -261,6 +318,8 @@ const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts'
 const { clinicDate, clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
+const { dispatchAdminBookingNotice, queueAdminBookingNotice } = await import('../src/lib/admin-booking-notices.ts');
+const { offerReleasedAppointment, runWaitlist } = await import('../src/lib/waitlist.ts');
 const { proposeAppointmentAction } = await import('../src/lib/appointment-actions.ts');
 const { addClinicTask, scheduleClinicTask } = await import('../src/lib/clinic-tasks.ts');
 const { transcribeWhatsAppAudio } = await import('../src/lib/audio.ts');
@@ -335,8 +394,124 @@ function answerButton(id, button, from = patient) {
 }
 
 function lastButtons() {
-  return metaRequests.at(-1).interactive.action.buttons.map(button => button.reply.id);
+  const { buttons, sections } = metaRequests.at(-1).interactive.action;
+  return buttons ? buttons.map(button => button.reply.id) : sections.flatMap(section => section.rows.map(row => row.id));
 }
+
+function seedWaitlistAppointment(id, phone, hour) {
+  const event = {
+    id, etag: 'v1', summary: 'Cita: Ana Demo', description: 'Conservar este detalle',
+    start: { dateTime: `2099-11-20T${hour}:00:00-06:00` },
+    end: { dateTime: `2099-11-20T${hour}:45:00-06:00` },
+    extendedProperties: { private: { patientPhone: phone, attendanceConfirmedFor: `2099-11-20T${hour}:00:00-06:00` } },
+  };
+  events.set(id, event);
+  return event;
+}
+
+async function joinWaitlist(phone, tag) {
+  await webhook([textMessage(`wait-menu-${tag}`, 'Lista de espera', phone)]);
+  await webhook([answerButton(`wait-detail-${tag}`, lastButtons().find(id => id.startsWith('appt_wait_')), phone)]);
+  await webhook([answerButton(`wait-enroll-${tag}`, lastButtons().find(id => id.startsWith('appt_wait_join_')), phone)]);
+  assert.match(metaRequests.at(-1).text.body, /lista de espera/);
+}
+
+test('waitlist offers a cancelled slot in FIFO order and moves only the patient who accepts', async () => {
+  const second = '525500000033';
+  const firstEvent = seedWaitlistAppointment('wait-first', patient, '17');
+  const secondEvent = seedWaitlistAppointment('wait-second', second, '18');
+  const cancelled = seedWaitlistAppointment('wait-opening', '525500000044', '16');
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  process.env.WHATSAPP_WAITLIST_TEMPLATE = 'cita_adelanto_lista_espera';
+  try {
+    await joinWaitlist(patient, 'first');
+    await joinWaitlist(second, 'second');
+    lastInbounds.set(second, new Date(Date.now() - 90_000_000).toISOString());
+    const expected = await liveCalendar.getCalendarAppointment(cancelled.id);
+    await proposeAppointmentAction(admin, { action: 'cancel_clinic', details: expected });
+    await webhook([answerButton('cancel-for-waitlist', lastButtons().find(id => id.startsWith('appointment_only_')), admin)]);
+    assert.equal(events.has(cancelled.id), false);
+    assert.equal(metaRequests.at(-1).to, patient);
+    assert.equal(metaRequests.at(-1).interactive.type, 'button');
+    assert.equal(events.get(firstEvent.id).start.dateTime, firstEvent.start.dateTime);
+    await webhook([answerButton('decline-first-wait-offer', lastButtons()[1], patient)]);
+    const offer = metaRequests.at(-1);
+    assert.equal(offer.to, second);
+    assert.equal(offer.template.name, 'cita_adelanto_lista_espera');
+    const accept = offer.template.components.find(component => component.type === 'button').parameters[0].payload;
+    await webhook([answerButton('wrong-patient-cannot-accept', accept, patient)]);
+    assert.equal(events.get(secondEvent.id).start.dateTime, secondEvent.start.dateTime);
+    const reply = id => ({ id, from: second, type: 'button', button: { payload: accept, text: 'Aceptar horario' } });
+    const patches = calendarPatches.length;
+    await Promise.all([webhook([reply('accept-second-wait-offer')]), webhook([reply('repeat-second-wait-offer')])]);
+    assert.equal(calendarPatches.length, patches + 1);
+    assert.equal(events.get(secondEvent.id).start.dateTime, '2099-11-20T22:00:00.000Z');
+    assert.equal(events.get(secondEvent.id).description, secondEvent.description);
+    assert.equal(events.get(firstEvent.id).start.dateTime, firstEvent.start.dateTime);
+    assert.equal(waitEntries.has(secondEvent.id), false);
+  } finally {
+    delete process.env.WHATSAPP_WAITLIST_TEMPLATE;
+    pendingAppointmentActions.clear();
+    lastInbounds.clear();
+    waitEntries.clear();
+    waitOpenings.clear();
+    events.clear();
+  }
+});
+
+test('expired waitlist offers pass to the next patient and an occupied slot preserves the original appointment', async () => {
+  const second = '525500000033';
+  seedWaitlistAppointment('wait-expire-first', patient, '17');
+  const original = seedWaitlistAppointment('wait-occupied-second', second, '18');
+  const cancelled = seedWaitlistAppointment('wait-release-later-occupied', '525500000044', '16');
+  try {
+    await joinWaitlist(patient, 'expires');
+    await joinWaitlist(second, 'still-available');
+    const expected = await liveCalendar.getCalendarAppointment(cancelled.id);
+    events.delete(cancelled.id);
+    await offerReleasedAppointment(expected);
+    const firstOffer = [...waitOpenings.values()][0];
+    firstOffer.deadline = new Date(Date.now() - 1000).toISOString();
+    await runWaitlist();
+    assert.equal(metaRequests.at(-1).to, second);
+    const accept = lastButtons()[0];
+    busyPeriods = [{ start: '2099-11-20T22:00:00Z', end: '2099-11-20T22:45:00Z' }];
+    await webhook([answerButton('wait-slot-no-longer-free', accept, second)]);
+    assert.match(metaRequests.at(-1).text.body, /ya no está disponible/);
+    assert.equal(events.get(original.id).start.dateTime, original.start.dateTime);
+  } finally {
+    busyPeriods = [];
+    waitEntries.clear();
+    waitOpenings.clear();
+    events.clear();
+  }
+});
+
+test('reception gets one same-day booking alert and closed windows use the approved utility template', async () => {
+  const today = new Date().toISOString();
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const before = metaRequests.length;
+  adminLastInbound = new Date(Date.now() - 1000).toISOString();
+  try {
+    await queueAdminBookingNotice('alert-same-day', today);
+    await Promise.all([dispatchAdminBookingNotice('alert-same-day', today), dispatchAdminBookingNotice('alert-same-day', today)]);
+    assert.equal(metaRequests.length, before + 1);
+    assert.equal(metaRequests.at(-1).to, admin);
+    assert.match(metaRequests.at(-1).text.body, /Para hoy/);
+    adminLastInbound = null;
+    await queueAdminBookingNotice('alert-closed-window', today);
+    await dispatchAdminBookingNotice('alert-closed-window', today);
+    assert.equal(bookingNotices.get('alert-closed-window').state, 'queued');
+    process.env.WHATSAPP_ADMIN_BOOKING_TEMPLATE = 'cita_nueva_recepcion';
+    await dispatchAdminBookingNotice('alert-closed-window', today);
+    assert.equal(metaRequests.at(-1).template.name, 'cita_nueva_recepcion');
+    assert.equal(metaRequests.at(-1).to, admin);
+  } finally {
+    adminLastInbound = null;
+    delete process.env.WHATSAPP_ADMIN_BOOKING_TEMPLATE;
+    bookingNotices.clear();
+  }
+});
 
 test('reception reviews a treatment description before saving and patients see the saved ficha', async () => {
   const treatment = treatments[0];
