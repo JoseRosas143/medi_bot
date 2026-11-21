@@ -5,7 +5,7 @@ import { findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, type Ca
 import { clinicDate, clinicDayRange, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
 import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
-import { findCatalogEntries, normalized, showAdminMenu, type Catalog } from '@/lib/menus';
+import { findCatalogEntries, normalized, showAdminMenu, showList, type Catalog } from '@/lib/menus';
 import { visitStatusLabel } from '@/lib/reception';
 import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -19,10 +19,20 @@ export async function showSchedule(phone: string, date = clinicDate(), events?: 
   const text = `🗓️ *Agenda · ${date}*\n${lines.length ? lines.join('\n') : 'Sin citas programadas.'}${appointments.length > 25 ? `\nHay ${appointments.length - 25} citas adicionales en Calendar.` : ''}\n\nPara buscar por número, escribe «Buscar cita por WhatsApp» y el número completo.`;
   const today = clinicDate();
   if (text.length > 1024) await sendWhatsAppText(phone, text);
+  const bodyText = text.length > 1024 ? 'Opciones de agenda' : text;
+  if (date === today) {
+    await showList(phone, bodyText, 'Ver opciones', [{ title: 'Recepción', rows: [
+      { id: 'rec_visits_0', title: 'Registrar visita' },
+      { id: 'rec_tomorrow', title: 'Mañana' },
+      { id: 'admin_wait_queue_0', title: 'Lista de espera' },
+      { id: 'admin_panel', title: 'Panel' },
+    ] }], 'Escribe «Lista de espera», «Agenda de mañana» o «Ayuda».');
+    return;
+  }
   await sendWhatsAppInteractiveButtons({
-    to: phone, bodyText: text.length > 1024 ? 'Opciones de agenda' : text,
+    to: phone, bodyText,
     buttons: [
-      date === today ? { id: 'rec_visits_0', title: 'Registrar visita' } : { id: 'admin_agenda', title: 'Agenda de hoy' },
+      { id: 'admin_agenda', title: 'Agenda de hoy' },
       ...(date !== nextDate(today) ? [{ id: 'rec_tomorrow', title: 'Mañana' }] : []),
       { id: 'admin_panel', title: 'Panel' },
     ],

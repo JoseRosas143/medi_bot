@@ -4,6 +4,7 @@ import { appointmentMatchesSlot, getAppointmentsByDateRange, getAvailableSlots, 
 import { withCalendarLock } from '@/lib/calendar-lock';
 import { clinicDate, clinicName, formatAppointment } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
+import { logWaitlistOffer, updateLoggedOffer, type WaitlistOfferStatus } from '@/lib/waitlist-offer-log';
 import { hasWhatsAppWindow, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 type Entry = { id: string; event_id: string; phone: string; original_start: string; original_end: string };
@@ -38,11 +39,13 @@ async function configuredTemplate() {
   return data?.waitlist_template?.trim() || undefined;
 }
 
-function reopen(opening: Opening) {
-  return updateOpening(opening, {
+async function reopen(opening: Opening, status: WaitlistOfferStatus = 'expired') {
+  const next = await updateOpening(opening, {
     state: available(opening) ? 'open' : 'closed',
     candidate_id: null, candidate_event_id: null, candidate_phone: null, offer_id: null, deadline: null,
   });
+  if (next && opening.offer_id) await updateLoggedOffer(opening.offer_id, status);
+  return next;
 }
 
 export async function showWaitlistRequest(phone: string, event: CalendarEventData, code: string) {
@@ -83,7 +86,7 @@ export async function changeWaitlistEnrollment(phone: string, event: CalendarEve
     const { data } = await openings().select('*').eq('candidate_phone', phone).eq('candidate_event_id', event.eventId)
       .eq('state', 'offered').maybeSingle().throwOnError();
     if (data) {
-      const next = await reopen(data as Opening);
+      const next = await reopen(data as Opening, 'withdrawn');
       if (next) await dispatchOpening(next);
     }
   }
@@ -144,11 +147,17 @@ async function dispatchOpening(opening: Opening) {
       offer_id: randomUUID(), deadline: expiry(deadline), attempted_ids: [...opening.attempted_ids, candidate.id],
     });
     if (!claimed) continue;
+    await logWaitlistOffer({
+      offer_id: claimed.offer_id!, request_id: candidate.id, phone: candidate.phone,
+      start_at: claimed.start_at, deadline: claimed.deadline,
+    });
     try {
       await sendOffer(claimed, inWindow, approved);
+      await updateLoggedOffer(claimed.offer_id!, 'sent', true);
     } catch (error) {
       // A definitive rejection releases the offer. An ambiguous response keeps it valid until its deadline.
-      if (error instanceof WhatsAppError && error.status === 400) await reopen(claimed);
+      if (error instanceof WhatsAppError && error.status === 400) await reopen(claimed, 'send_error');
+      else await updateLoggedOffer(claimed.offer_id!, 'unknown', true);
       console.error('Waitlist offer not confirmed', { code: error instanceof WhatsAppError ? error.code : undefined });
     }
     return;
@@ -180,6 +189,7 @@ async function getCandidate(opening: Opening) {
 async function completeMove(opening: Opening, entry: Entry) {
   const closed = await updateOpening(opening, { state: 'closed', deadline: null });
   if (!closed) return;
+  await updateLoggedOffer(opening.offer_id!, 'accepted');
   await requests().delete().eq('event_id', entry.event_id).eq('id', entry.id).throwOnError();
   const released = await queueOpening({ eventId: entry.event_id, patientPhone: entry.phone, summary: '', ...entrySlot(entry) });
   try {
@@ -200,7 +210,7 @@ export async function handleWaitlistOffer(phone: string, option: string | undefi
     return true;
   }
   if (match[1] === 'decline') {
-    const next = await reopen(opening);
+    const next = await reopen(opening, 'declined');
     await sendWhatsAppText(phone, 'Conservas tu cita en el horario actual.');
     if (next) await dispatchOpening(next);
     return true;
@@ -214,7 +224,7 @@ export async function handleWaitlistOffer(phone: string, option: string | undefi
   const entry = await getCandidate(processing);
   const current = entry ? await getCalendarAppointment(entry.event_id) : null;
   if (!entry || !current || !appointmentMatchesSlot(current, phone, entrySlot(entry)) || !available(processing)) {
-    const next = await reopen(processing);
+    const next = await reopen(processing, 'unavailable');
     await sendWhatsAppText(phone, 'La oferta o tu cita cambió. Consulta tu horario en «Mis citas».');
     if (next) await dispatchOpening(next);
     return true;
@@ -225,7 +235,7 @@ export async function handleWaitlistOffer(phone: string, option: string | undefi
     await updateOpening(processing, { state: 'offered', deadline: opening.deadline });
     await sendWhatsAppText(phone, 'La agenda está ocupada en este momento. Puedes volver a pulsar «Aceptar horario» mientras la oferta siga vigente.');
   } else {
-    const next = await reopen(processing);
+    const next = await reopen(processing, 'unavailable');
     await sendWhatsAppText(phone, 'El espacio ya no está disponible para tu cita. Consulta tu horario en «Mis citas».');
     if (next) await dispatchOpening(next);
   }
@@ -258,7 +268,7 @@ export async function runWaitlist() {
         continue;
       }
     }
-    await reopen(row);
+    await reopen(row, row.state === 'processing' ? 'unavailable' : 'expired');
   }
   const { data } = await openings().select('*').eq('state', 'open').order('checked_at').order('start_at').limit(4).throwOnError();
   for (const row of (data ?? []) as Opening[]) await dispatchOpening(row);
