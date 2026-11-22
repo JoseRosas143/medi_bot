@@ -39,6 +39,7 @@ const bookingDrafts = new Map();
 const treatmentDrafts = new Map();
 const waitEntries = new Map();
 const waitOpenings = new Map();
+const waitOffers = new Map();
 const bookingNotices = new Map();
 const lastInbounds = new Map();
 let adminLastInbound = null;
@@ -182,7 +183,8 @@ function query(table) {
         }
         let rows = [...storage.entries()].map(([key, row]) => [key, isEntry ? {
           ...row, duration_seconds: (Date.parse(row.original_end) - Date.parse(row.original_start)) / 1000,
-          patients: { chat_mode: 'AI_ACTIVE', last_inbound_at: lastInbounds.get(row.phone) ?? new Date(Date.now() - 1000).toISOString() },
+          patients: { full_name: patientNames.get(row.phone), chat_mode: 'AI_ACTIVE',
+            last_inbound_at: lastInbounds.get(row.phone) ?? new Date(Date.now() - 1000).toISOString() },
         } : { ...row }]).filter(([, row]) =>
           Object.entries(filters).every(([field, value]) => readField(row, field) === value) && constraints.every(check => check(row)));
         for (const { field, ascending } of [...sorts].reverse()) rows.sort(([, a], [, b]) =>
@@ -200,6 +202,21 @@ function query(table) {
         }
         if (operation === 'delete') rows.forEach(([key]) => storage.delete(key));
         return resolve({ data: singleRow ? rows[0]?.[1] ?? null : rows.map(([, row]) => row), error: null });
+      }
+      if (table === 'waitlist_offer_history') {
+        if (operation === 'insert') {
+          waitOffers.set(values.offer_id, { created_at: new Date().toISOString(), ...values });
+          return resolve({ data: null, error: null });
+        }
+        let rows = [...waitOffers.values()].filter(row =>
+          Object.entries(filters).every(([field, value]) => row[field] === value));
+        if (operation === 'update') rows.forEach(row => Object.assign(row, values));
+        for (const { field, ascending } of [...sorts].reverse()) rows.sort((a, b) =>
+          (a[field] > b[field] ? 1 : a[field] < b[field] ? -1 : 0) * (ascending ? 1 : -1));
+        if (range) rows = rows.slice(range[0], range[1] + 1);
+        if (limit) rows = rows.slice(0, limit);
+        const joined = rows.map(row => ({ ...row, patients: { full_name: patientNames.get(row.phone) } }));
+        return resolve({ data: singleRow ? joined[0] ?? null : joined, error: null });
       }
       if (table === 'clinic_tasks') {
         if (operation === 'insert') {
@@ -422,10 +439,20 @@ test('waitlist offers a cancelled slot in FIFO order and moves only the patient 
   const secondEvent = seedWaitlistAppointment('wait-second', second, '18');
   const cancelled = seedWaitlistAppointment('wait-opening', '525500000044', '16');
   const admin = process.env.ADMIN_PHONE_NUMBER;
+  patientNames.set(patient, 'Ana Demo');
+  patientNames.set(second, 'Luis Demo');
   process.env.WHATSAPP_WAITLIST_TEMPLATE = 'cita_adelanto_lista_espera';
   try {
     await joinWaitlist(patient, 'first');
     await joinWaitlist(second, 'second');
+    const beforePatientView = metaRequests.length;
+    await webhook([answerButton('patient-cannot-read-admin-waitlist', 'admin_wait_queue_0', patient)]);
+    assert.equal(metaRequests.length, beforePatientView);
+    await webhook([answerButton('admin-agenda-waitlist-link', 'admin_agenda', admin)]);
+    assert.ok(lastButtons().includes('admin_wait_queue_0'));
+    await webhook([answerButton('admin-read-waitlist', 'admin_wait_queue_0', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /1\. Ana Demo[\s\S]*Sin oferta registrada[\s\S]*2\. Luis Demo/);
+    assert.doesNotMatch(metaRequests.at(-1).interactive.body.text, new RegExp(patient));
     lastInbounds.set(second, new Date(Date.now() - 90_000_000).toISOString());
     const expected = await liveCalendar.getCalendarAppointment(cancelled.id);
     await proposeAppointmentAction(admin, { action: 'cancel_clinic', details: expected });
@@ -434,7 +461,10 @@ test('waitlist offers a cancelled slot in FIFO order and moves only the patient 
     assert.equal(metaRequests.at(-1).to, patient);
     assert.equal(metaRequests.at(-1).interactive.type, 'button');
     assert.equal(events.get(firstEvent.id).start.dateTime, firstEvent.start.dateTime);
-    await webhook([answerButton('decline-first-wait-offer', lastButtons()[1], patient)]);
+    const decline = lastButtons()[1];
+    await webhook([textMessage('admin-read-waitlist-with-offer', 'Lista de espera', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /1\. Ana Demo[\s\S]*Enviada a WhatsApp[\s\S]*2\. Luis Demo[\s\S]*Sin oferta registrada/);
+    await webhook([answerButton('decline-first-wait-offer', decline, patient)]);
     const offer = metaRequests.at(-1);
     assert.equal(offer.to, second);
     assert.equal(offer.template.name, 'cita_adelanto_lista_espera');
@@ -449,12 +479,18 @@ test('waitlist offers a cancelled slot in FIFO order and moves only the patient 
     assert.equal(events.get(secondEvent.id).description, secondEvent.description);
     assert.equal(events.get(firstEvent.id).start.dateTime, firstEvent.start.dateTime);
     assert.equal(waitEntries.has(secondEvent.id), false);
+    await webhook([answerButton('admin-waitlist-history', 'admin_wait_offers_0', admin)]);
+    const history = metaRequests.at(-1).interactive.body.text;
+    assert.match(history, /Luis Demo[^\n]*\n[^\n]*Aceptada/);
+    assert.match(history, /Ana Demo[^\n]*\n[^\n]*Rechazada por el paciente/);
   } finally {
     delete process.env.WHATSAPP_WAITLIST_TEMPLATE;
     pendingAppointmentActions.clear();
     lastInbounds.clear();
     waitEntries.clear();
     waitOpenings.clear();
+    waitOffers.clear();
+    patientNames.clear();
     events.clear();
   }
 });
@@ -483,6 +519,7 @@ test('expired waitlist offers pass to the next patient and an occupied slot pres
     busyPeriods = [];
     waitEntries.clear();
     waitOpenings.clear();
+    waitOffers.clear();
     events.clear();
   }
 });
