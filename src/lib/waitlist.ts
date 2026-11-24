@@ -48,6 +48,29 @@ async function reopen(opening: Opening, status: WaitlistOfferStatus = 'expired')
   return next;
 }
 
+export async function withdrawWaitlistRequest(requestId: string, ownerPhone?: string) {
+  const result = await withCalendarLock(randomUUID(), async () => {
+    let entryQuery = requests().delete().eq('id', requestId);
+    if (ownerPhone) entryQuery = entryQuery.eq('phone', ownerPhone);
+
+    const { data } = await openings().select('*').eq('candidate_id', requestId)
+      .in('state', ['offered', 'processing']).maybeSingle().throwOnError();
+    const opening = data as Opening | null;
+    if (opening?.state === 'processing') return { state: 'processing' } as const;
+
+    const { data: removed } = await entryQuery.select('id').maybeSingle().throwOnError();
+    if (!removed && (!opening || (ownerPhone && opening.candidate_phone !== ownerPhone))) return { state: 'missing' } as const;
+    let next: Opening | null = null;
+    if (opening) next = await reopen(opening, 'withdrawn');
+    return { state: 'removed', next } as const;
+  });
+  if (result.state !== 'removed') return result;
+  if (result.next?.state === 'open') {
+    await dispatchOpening(result.next).catch(() => console.error('Could not dispatch the released waitlist offer'));
+  }
+  return { state: 'removed', releasedOffer: result.next?.state === 'open' } as const;
+}
+
 export async function showWaitlistRequest(phone: string, event: CalendarEventData, code: string) {
   const { data } = await requests().select('*').eq('event_id', event.eventId).eq('phone', phone).maybeSingle().throwOnError();
   const enrolled = data && appointmentMatchesSlot(event, phone, entrySlot(data as Entry));
@@ -77,19 +100,19 @@ export async function changeWaitlistEnrollment(phone: string, event: CalendarEve
       } else await requests().update(row).eq('event_id', event.eventId).eq('id', data.id).throwOnError();
     }
   } else {
-    await requests().delete().eq('event_id', event.eventId).eq('phone', phone).eq('original_start', event.start).throwOnError();
+    const { data } = await requests().select('id').eq('event_id', event.eventId)
+      .eq('phone', phone).eq('original_start', event.start).maybeSingle().throwOnError();
+    if (data) {
+      const result = await withdrawWaitlistRequest(data.id, phone);
+      if (result.state === 'busy' || result.state === 'processing') {
+        await sendWhatsAppText(phone, 'La agenda está verificando una operación. Intenta salir de la lista en un momento.');
+        return;
+      }
+    }
   }
   await sendWhatsAppText(phone, join
     ? '✅ Aparté tu lugar en la lista de espera. Tu cita sigue en el horario original.'
     : 'Saliste de la lista de espera. Tu cita sigue en el horario original.');
-  if (!join) {
-    const { data } = await openings().select('*').eq('candidate_phone', phone).eq('candidate_event_id', event.eventId)
-      .eq('state', 'offered').maybeSingle().throwOnError();
-    if (data) {
-      const next = await reopen(data as Opening, 'withdrawn');
-      if (next) await dispatchOpening(next);
-    }
-  }
 }
 
 async function sendOffer(opening: Opening, inWindow: boolean, approved?: string) {
@@ -147,6 +170,11 @@ async function dispatchOpening(opening: Opening) {
       offer_id: randomUUID(), deadline: expiry(deadline), attempted_ids: [...opening.attempted_ids, candidate.id],
     });
     if (!claimed) continue;
+    if (!await getCandidate(claimed)) {
+      const next = await reopen(claimed, 'withdrawn');
+      if (next) await dispatchOpening(next);
+      return;
+    }
     await logWaitlistOffer({
       offer_id: claimed.offer_id!, request_id: candidate.id, phone: candidate.phone,
       start_at: claimed.start_at, deadline: claimed.deadline,
@@ -211,31 +239,32 @@ export async function handleWaitlistOffer(phone: string, option: string | undefi
   }
   if (match[1] === 'decline') {
     const next = await reopen(opening, 'declined');
-    await sendWhatsAppText(phone, 'Conservas tu cita en el horario actual.');
+    await sendWhatsAppText(phone, next ? 'Conservas tu cita en el horario actual.'
+      : 'La oferta ya cambió. Consulta el horario en «Mis citas».');
     if (next) await dispatchOpening(next);
     return true;
   }
 
-  const processing = await updateOpening(opening, { state: 'processing', deadline: expiry(Date.now() + 120_000) });
-  if (!processing) {
-    await sendWhatsAppText(phone, 'Esa oferta ya está en revisión. Consulta el horario en «Mis citas».');
-    return true;
-  }
-  const entry = await getCandidate(processing);
-  const current = entry ? await getCalendarAppointment(entry.event_id) : null;
-  if (!entry || !current || !appointmentMatchesSlot(current, phone, entrySlot(entry)) || !available(processing)) {
-    const next = await reopen(processing, 'unavailable');
-    await sendWhatsAppText(phone, 'La oferta o tu cita cambió. Consulta tu horario en «Mis citas».');
-    if (next) await dispatchOpening(next);
-    return true;
-  }
-  const result = await withCalendarLock(processing.id, () => moveCalendarAppointment(current, phone, processing.start_at));
-  if (result.state === 'confirmed') await completeMove(processing, entry);
+  const result = await withCalendarLock(randomUUID(), async () => {
+    if (!available(opening) || Date.parse(opening.deadline || '') <= Date.now()) return { state: 'stale' } as const;
+    const processing = await updateOpening(opening, { state: 'processing', deadline: expiry(Date.now() + 120_000) });
+    if (!processing) return { state: 'stale' } as const;
+    const entry = await getCandidate(processing);
+    const current = entry ? await getCalendarAppointment(entry.event_id) : null;
+    if (!entry || !current || !appointmentMatchesSlot(current, phone, entrySlot(entry))) {
+      return { state: 'unavailable', processing } as const;
+    }
+    const move = await moveCalendarAppointment(current, phone, processing.start_at);
+    return move.state === 'confirmed' ? { state: 'confirmed', processing, entry } as const
+      : { state: 'unavailable', processing } as const;
+  });
+  if (result.state === 'confirmed') await completeMove(result.processing, result.entry);
   else if (result.state === 'busy') {
-    await updateOpening(processing, { state: 'offered', deadline: opening.deadline });
     await sendWhatsAppText(phone, 'La agenda está ocupada en este momento. Puedes volver a pulsar «Aceptar horario» mientras la oferta siga vigente.');
+  } else if (result.state === 'stale') {
+    await sendWhatsAppText(phone, 'La oferta ya cambió. Consulta el horario en «Mis citas».');
   } else {
-    const next = await reopen(processing, 'unavailable');
+    const next = await reopen(result.processing, 'unavailable');
     await sendWhatsAppText(phone, 'El espacio ya no está disponible para tu cita. Consulta tu horario en «Mis citas».');
     if (next) await dispatchOpening(next);
   }
