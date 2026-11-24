@@ -58,6 +58,8 @@ let upcomingAppointments = [];
 const events = new Map();
 const pendingAppointmentActions = new Map();
 const patientNames = new Map();
+const directoryContacts = new Set();
+const directoryActivity = new Map();
 const calendarPatches = [];
 let busyPeriods = [];
 let persistCalendarWrites = true;
@@ -157,13 +159,8 @@ function query(table) {
     },
     eq: (field, value) => { filters[field] = value; return chain; },
     in: (field, choices) => { constraints.push(row => choices.includes(row[field])); return chain; },
-    ilike: (field, value) => {
-      const pattern = value.toLowerCase();
-      constraints.push(row => pattern.startsWith('%') && pattern.endsWith('%')
-        ? row[field]?.toLowerCase().includes(pattern.slice(1, -1))
-        : row[field]?.toLowerCase() === pattern);
-      return chain;
-    },
+    like: (field, value) => filterLike(field, value, ''),
+    ilike: (field, value) => filterLike(field, value, 'i'),
     lt: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) < value); return chain; },
     lte: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) <= value); return chain; },
     not: (field, _operator, value) => {
@@ -368,13 +365,24 @@ function query(table) {
         return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
       if (table === 'patients' && operation === 'select') {
-        if (!filters.phone) return resolve({ data: [...patientNames.entries()].map(([phone, full_name]) => ({ phone, full_name }))
-          .filter(row => constraints.every(check => check(row))).slice(0, limit) });
+        if (!filters.phone) {
+          const phones = new Set([...patientNames.keys(), ...directoryContacts]);
+          let rows = [...phones].map(phone => ({ phone, full_name: patientNames.get(phone), last_inbound_at: directoryActivity.get(phone) || '' }))
+            .filter(row => constraints.every(check => check(row)))
+            .sort((a, b) => b.last_inbound_at.localeCompare(a.last_inbound_at) || a.phone.localeCompare(b.phone));
+          if (range) rows = rows.slice(range[0], range[1] + 1);
+          return resolve({ data: rows.slice(0, limit) });
+        }
         return resolve({ data: {
           phone: filters.phone, full_name: patientNames.get(filters.phone) ?? 'Ana Demo',
           last_inbound_at: lastInbounds.get(filters.phone),
           chat_mode: 'AI_ACTIVE', human_session_id: null,
         } });
+      }
+      if (table === 'patients' && operation === 'upsert') directoryContacts.add(values.phone);
+      if (table === 'patients' && operation === 'update' && values.last_inbound_at) {
+        const previous = directoryActivity.get(filters.phone);
+        if (!previous || previous < values.last_inbound_at) directoryActivity.set(filters.phone, values.last_inbound_at);
       }
       if (table === 'patients' && operation === 'update' && values.full_name && filters.phone) {
         patientNames.set(filters.phone, values.full_name);
@@ -391,6 +399,13 @@ function query(table) {
       return resolve({ data: null, error: null });
     },
   };
+  function filterLike(field, value, flags) {
+    const pattern = Array.from(value, char => char === '%' ? '.*' : char === '_' ? '.'
+      : `\\u{${char.codePointAt(0).toString(16)}}`).join('');
+    const matcher = new RegExp(`^${pattern}$`, `${flags}u`);
+    constraints.push(row => row[field] != null && matcher.test(row[field]));
+    return chain;
+  }
   return chain;
 }
 const readField = (row, field) => field.split('.').reduce((value, part) => value?.[part], row);
@@ -611,6 +626,41 @@ test('weekly hours constrain Calendar slots and patients can propose a specific 
   }
 });
 
+test('admin CRM lists new contacts first, paginates, and finds names without accents and WhatsApp suffixes', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const newPhone = '525588991234';
+  const olderPhones = Array.from({ length: 7 }, (_, index) => `52559988123${index}`);
+  for (const phone of olderPhones) {
+    patientNames.set(phone, phone === olderPhones[0] ? 'Óscar Núñez' : 'Paciente de prueba');
+    directoryActivity.set(phone, '2022-05-01T00:00:00.000Z');
+  }
+  try {
+    await webhook([textMessage('crm-new-contact-hi', 'Hola', newPhone)]);
+    await webhook([answerButton('crm-directory-open', 'admin_crm', admin)]);
+    const patientRows = metaRequests.at(-1).interactive.action.sections[0].rows;
+    assert.equal(patientRows.length, 6);
+    assert.deepEqual(patientRows[0], { id: `crm_view_${newPhone}`, title: 'Paciente sin nombre', description: 'WhatsApp •••• 1234' });
+    assert.ok(lastButtons().includes('crm_directory_1'));
+    await webhook([answerButton('crm-directory-next', 'crm_directory_1', admin)]);
+    assert.ok(lastButtons().includes(`crm_view_${olderPhones.at(-1)}`));
+    assert.ok(lastButtons().includes('crm_directory_0'));
+    await webhook([textMessage('crm-directory-accent-search', 'Buscar paciente oscar nunez', admin)]);
+    assert.deepEqual(lastButtons(), [`crm_view_${olderPhones[0]}`, 'admin_crm']);
+    await webhook([textMessage('crm-directory-suffix-search', 'Buscar paciente 1234', admin)]);
+    assert.ok(lastButtons().includes(`crm_view_${newPhone}`));
+    await webhook([answerButton('crm-directory-non-admin', 'admin_crm', newPhone)]);
+    const patientMessages = metaRequests.filter(message => message.to === newPhone);
+    assert.ok(patientMessages.every(message => !message.interactive?.body.text.includes('Directorio de pacientes')));
+  } finally {
+    for (const phone of olderPhones) {
+      patientNames.delete(phone);
+      directoryActivity.delete(phone);
+    }
+    directoryContacts.delete(newPhone);
+    directoryActivity.delete(newPhone);
+  }
+});
+
 test('admin CRM searches, sends a confirmed message and adjusts a balance without exposing it to another patient', async () => {
   const admin = process.env.ADMIN_PHONE_NUMBER;
   const other = '525500000088';
@@ -619,7 +669,7 @@ test('admin CRM searches, sends a confirmed message and adjusts a balance withou
   lastInbounds.set(patient, new Date(Date.now() - 1000).toISOString());
   try {
     await webhook([textMessage('admin-crm-search-test', 'Buscar paciente Ana', admin)]);
-    assert.deepEqual(lastButtons(), [`crm_view_${patient}`]);
+    assert.deepEqual(lastButtons(), [`crm_view_${patient}`, 'admin_crm']);
     await webhook([answerButton('admin-crm-record-test', lastButtons()[0], admin)]);
     assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo[\s\S]*Próxima cita/);
     const visit = seedWaitlistAppointment('crm-past-visit', patient, '16');
@@ -1316,6 +1366,7 @@ test('the admin books for the patient and confirms name, contact, and reason', a
   assert.ok(metaRequests.slice(before).every(message => message.to === admin && !message.text?.body.includes('maps.app.goo.gl')));
   assert.equal(createdAppointments.at(-1).patientPhone, '525512345678');
   assert.equal(createdAppointments.at(-1).patientName, 'Sofía Ramírez');
+  assert.ok(directoryContacts.has('525512345678'));
 });
 
 test('the cron rejects missing or mismatched credentials', async () => {

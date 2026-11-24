@@ -255,6 +255,10 @@ async function markConfirmed(draft: Draft) {
   if (alertAdmin) await queueAdminBookingNotice(bookingId, selected.start).catch(() => console.error('Could not queue booking notice'));
   const updated = await replaceDraft(draft, 'confirmed', { selected: draft.details.selected });
   if (!updated) return;
+  if (!original && patientPhone && patientPhone !== draft.actor_phone) {
+    const { error } = await db.from('patients').upsert({ phone: patientPhone }, { onConflict: 'phone', ignoreDuplicates: true });
+    if (error) console.error('Could not register the new appointment contact', { code: error.code });
+  }
   const moved = Boolean(original);
   const status = moved ? 'Cita reagendada' : 'Cita confirmada';
   const attendance = moved ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : '';
