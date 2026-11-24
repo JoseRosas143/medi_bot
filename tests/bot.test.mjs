@@ -43,6 +43,8 @@ const waitOffers = new Map();
 let calendarLock = null;
 const bookingNotices = new Map();
 const lastInbounds = new Map();
+const humanSessions = new Map();
+const escalationMappings = new Map();
 let adminLastInbound = null;
 const clinicTasks = new Map();
 let taskReminderTemplate = null;
@@ -364,22 +366,35 @@ function query(table) {
       if (table === 'appointment_notices' && operation === 'select') {
         return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
+      if (table === 'escalation_mappings') {
+        if (operation === 'insert') escalationMappings.set(values.wa_message_id, values);
+        return resolve({ data: escalationMappings.get(filters.wa_message_id) ?? null, error: null });
+      }
       if (table === 'patients' && operation === 'select') {
         if (!filters.phone) {
           const phones = new Set([...patientNames.keys(), ...directoryContacts]);
-          let rows = [...phones].map(phone => ({ phone, full_name: patientNames.get(phone), last_inbound_at: directoryActivity.get(phone) || '' }))
+          let rows = [...phones].map(phone => ({ phone, full_name: patientNames.get(phone), last_inbound_at: lastInbounds.get(phone) || directoryActivity.get(phone) || '' }))
             .filter(row => constraints.every(check => check(row)))
             .sort((a, b) => b.last_inbound_at.localeCompare(a.last_inbound_at) || a.phone.localeCompare(b.phone));
           if (range) rows = rows.slice(range[0], range[1] + 1);
           return resolve({ data: rows.slice(0, limit) });
         }
-        return resolve({ data: {
+        const session = humanSessions.get(filters.phone) ?? null;
+        const row = {
           phone: filters.phone, full_name: patientNames.get(filters.phone) ?? 'Ana Demo',
           last_inbound_at: lastInbounds.get(filters.phone),
-          chat_mode: 'AI_ACTIVE', human_session_id: null,
-        } });
+          chat_mode: session ? 'WAITING_HUMAN' : 'AI_ACTIVE', human_session_id: session,
+        };
+        return resolve({ data: Object.entries(filters).every(([key, value]) => row[key] === value) ? row : null });
       }
       if (table === 'patients' && operation === 'upsert') directoryContacts.add(values.phone);
+      if (table === 'patients' && operation === 'update' && values.chat_mode) {
+        const current = humanSessions.get(filters.phone);
+        if (filters.chat_mode === 'AI_ACTIVE' ? current : current !== filters.human_session_id) return resolve({ data: null });
+        if (values.human_session_id) humanSessions.set(filters.phone, values.human_session_id);
+        else humanSessions.delete(filters.phone);
+        return resolve({ data: { phone: filters.phone }, error: null });
+      }
       if (table === 'patients' && operation === 'update' && values.last_inbound_at) {
         const previous = directoryActivity.get(filters.phone);
         if (!previous || previous < values.last_inbound_at) directoryActivity.set(filters.phone, values.last_inbound_at);
@@ -497,6 +512,7 @@ test('catalog and admin lists fit Meta limits and leave space for navigation', a
   }
   assert.deepEqual(catalog.interactive.action.sections[1].rows.map(row => row.id), ['trt_page_0', 'menu_principal']);
   assert.ok(admin.interactive.action.sections.some(section => section.rows.some(row => row.id === 'admin_booking')));
+  assert.ok(admin.interactive.action.sections.some(section => section.rows.some(row => row.id === 'admin_message_number')));
 });
 
 function textMessage(id, body, from = patient) {
@@ -661,6 +677,69 @@ test('admin CRM lists new contacts first, paginates, and finds names without acc
   }
 });
 
+test('reception opens a two-way chat by number and closes only that session', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const phone = '5215544556677';
+  patientNames.set(phone, 'María Demo');
+  lastInbounds.set(phone, new Date(Date.now() - 1000).toISOString());
+  adminLastInbound = new Date().toISOString();
+  try {
+    await webhook([answerButton('chat-number-open', 'admin_message_number', admin)]);
+    assert.match(metaRequests.at(-1).text.body, /Escribe el WhatsApp/);
+    await webhook([textMessage('chat-number-entered', '55 4455 6677', admin)]);
+    assert.match(metaRequests.at(-1).text.body, /María Demo.*6677/);
+    await webhook([{ ...textMessage('chat-number-draft', 'Te escribe recepción.', admin), context: { id: `mock_${metaRequests.length}` } }]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /María Demo.*6677/);
+    await webhook([answerButton('chat-number-confirm', lastButtons()[0], admin)]);
+    assert.deepEqual(metaRequests.at(-2).text, { body: 'Te escribe recepción.' });
+    assert.equal(metaRequests.at(-2).to, phone);
+    const [close] = lastButtons();
+    const adminReceipt = `mock_${metaRequests.length}`;
+    await webhook([{ ...textMessage('chat-admin-follows-up', '¿Nos puedes responder?', admin), context: { id: adminReceipt } }]);
+    assert.equal(metaRequests.at(-2).to, phone);
+    await webhook([textMessage('chat-patient-replies', 'Sí, aquí estoy.', phone)]);
+    assert.equal(metaRequests.at(-1).to, admin);
+    assert.match(metaRequests.at(-1).text.body, /Sí, aquí estoy/);
+    await webhook([answerButton('chat-patient-cannot-close-for-admin', close, phone)]);
+    assert.ok(humanSessions.has(phone));
+    await webhook([answerButton('chat-admin-closes', close, admin)]);
+    assert.equal(humanSessions.has(phone), false);
+    assert.match(metaRequests.at(-1).text.body, /vuelvo a atenderte/);
+    await webhook([textMessage('chat-patient-back-to-bot', 'Hola', phone)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Hola de nuevo, María Demo/);
+    await webhook([answerButton('chat-start-new-session', 'doctor', phone)]);
+    const secondSession = humanSessions.get(phone);
+    assert.ok(secondSession);
+    await webhook([answerButton('chat-old-close-cannot-close-new', close, admin)]);
+    assert.equal(humanSessions.get(phone), secondSession);
+    assert.match(metaRequests.at(-1).text.body, /ya está cerrada/);
+  } finally {
+    for (const state of [patientNames, lastInbounds, humanSessions, directoryActivity]) state.delete(phone);
+    directoryContacts.delete(phone);
+    adminLastInbound = null;
+    clinicDrafts.clear();
+  }
+});
+
+test('a patient handoff uses the approved reception template when the admin window is closed', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const phone = '525544551199';
+  adminLastInbound = null;
+  try {
+    await webhook([answerButton('chat-closed-admin-window', 'doctor', phone)]);
+    const notice = metaRequests.at(-2);
+    assert.equal(notice.to, admin);
+    assert.equal(notice.template.name, 'solicitud_atencion_recepcion');
+    assert.equal(notice.template.language.code, 'es_MX');
+    assert.equal(escalationMappings.get(`mock_${metaRequests.length - 1}`).patient_phone, phone);
+    assert.equal(metaRequests.at(-1).to, phone);
+  } finally {
+    humanSessions.delete(phone);
+    directoryContacts.delete(phone);
+    directoryActivity.delete(phone);
+  }
+});
+
 test('admin CRM searches, sends a confirmed message and adjusts a balance without exposing it to another patient', async () => {
   const admin = process.env.ADMIN_PHONE_NUMBER;
   const other = '525500000088';
@@ -681,6 +760,9 @@ test('admin CRM searches, sends a confirmed message and adjusts a balance withou
     await confirmAdminInput(`crm_message_${patient}`, 'Hola desde recepción.', 'crm-message');
     assert.equal(metaRequests.at(-2).to, patient);
     assert.equal(metaRequests.at(-2).text.body, 'Hola desde recepción.');
+    assert.ok(humanSessions.get(patient));
+    await webhook([answerButton('crm-close-after-send', lastButtons()[0], admin)]);
+    assert.equal(humanSessions.has(patient), false);
     lastInbounds.delete(patient);
     await confirmAdminInput(`crm_message_${patient}`, 'Este mensaje debe esperar.', 'crm-message-closed');
     assert.match(metaRequests.at(-1).text.body, /La ventana de WhatsApp está cerrada/);

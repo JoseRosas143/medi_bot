@@ -54,15 +54,25 @@ export async function showAdminMenu(to: string) {
       { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
       { id: 'admin_cancelar', title: 'Administrar cita', description: 'Corrige el WhatsApp o cancela' },
       { id: 'admin_tasks_menu', title: 'Pendientes', description: 'Anota y consulta tareas' },
-      { id: 'admin_crm', title: 'Pacientes · CRM' },
       { id: 'admin_config', title: 'Configuración', description: 'Edita nombres y horario' },
     ] },
+    { title: 'Pacientes', rows: [
+      { id: 'admin_crm', title: 'Pacientes · CRM' },
+      { id: 'admin_message_number', title: 'Enviar mensaje a número', description: 'Abre un chat con recepción' },
+    ] },
     { title: 'Catálogo', rows: [
-      { id: 'adm_add_treatment', title: 'Agregar tratamiento' },
-      { id: 'adm_edit_treatment', title: 'Editar tratamiento', description: 'Actualiza la descripción, el precio o la visibilidad' },
+      { id: 'adm_treatment_menu', title: 'Tratamientos', description: 'Agrega o edita tratamientos' },
       { id: 'adm_faq_menu', title: 'Preguntas frecuentes', description: 'Agrega o edita preguntas' },
     ] },
   ]);
+}
+
+export function showAdminTreatmentMenu(to: string) {
+  return showList(to, '*Tratamientos*', 'Ver opciones', [{ title: 'Catálogo', rows: [
+    { id: 'adm_add_treatment', title: 'Agregar tratamiento' },
+    { id: 'adm_edit_treatment', title: 'Editar tratamiento' },
+    { id: 'admin_panel', title: 'Volver al panel' },
+  ] }]);
 }
 
 export function showAdminFaqMenu(to: string) {

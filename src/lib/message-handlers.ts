@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicDate, clinicName, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { handleAppointmentAction, handleCancellationContactReply } from '@/lib/appointment-actions';
@@ -12,10 +11,11 @@ import { handleTreatmentEditor } from '@/lib/treatment-editor';
 import { handleWaitlistOffer } from '@/lib/waitlist';
 import { handleAdminWaitlist } from '@/lib/waitlist-admin';
 import { handleClinicAdministration, showPatientBalance } from '@/lib/clinic-admin';
-import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showCatalog, showPatientMenu } from '@/lib/menus';
+import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showAdminTreatmentMenu, showCatalog, showPatientMenu } from '@/lib/menus';
 import { getSchedulableTreatment } from '@/lib/treatment-duration';
 import { handlePatientNameCorrection } from '@/lib/patient-name';
-import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
+import { closeHumanChat, openHumanChat, trackHumanChatReply, recordChatMessage as history, type HumanPatient } from '@/lib/human-chat';
+import { hasWhatsAppWindow, isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 export type IncomingMessage = {
   from: string;
@@ -27,13 +27,9 @@ export type IncomingMessage = {
 };
 
 const menuRequests = new Set(['hola', 'menu', 'ayuda', 'inicio', 'opciones', 'menu principal']);
-const closeRequests = new Set(['cerrar', 'cerrar conversacion', 'listo']);
+const closeRequests = new Set(['cerrar', 'cerrar chat', 'cerrar conversacion', 'listo']);
 const emergencyWords = /no puedo respirar|dificultad para respirar|sangrado (?:abundante|incontrolable)|sangrado que no (?:se detiene|para)|dolor de pecho|perdi el conocimiento/;
 const humanRequest = /^(?:(?:quiero|necesito|puedo)\s+)?hablar con (?:el |la |un |una )?(?:doctor|doctora|dentista|especialista|humano|recepcion)$/;
-
-async function history(phone: string, role: 'user' | 'assistant' | 'doctor', content: string) {
-  await db.from('chat_messages').insert({ patient_phone: phone, role, content }).throwOnError();
-}
 
 function parseName(content: string) {
   const name = content.trim().replace(/^(?:hola[,.!]?\s*)?(?:me llamo|mi nombre es|soy)\s+/i, '').trim().replace(/[.!]$/, '');
@@ -42,19 +38,9 @@ function parseName(content: string) {
   return name;
 }
 
-type HumanPatient = { phone: string; full_name: string | null; chat_mode: string; human_session_id: string | null };
-
 function inboundTime(timestamp: string | undefined) {
   const millis = Number(timestamp) * 1000;
   return new Date(Number.isFinite(millis) && millis > 0 ? Math.min(millis, Date.now()) : Date.now()).toISOString();
-}
-
-async function closeHumanChat(patient: HumanPatient) {
-  let update = db.from('patients').update({ chat_mode: 'AI_ACTIVE', human_session_id: null })
-    .eq('phone', patient.phone).eq('chat_mode', 'WAITING_HUMAN');
-  update = patient.human_session_id ? update.eq('human_session_id', patient.human_session_id) : update.is('human_session_id', null);
-  const { data } = await update.select('phone').maybeSingle().throwOnError();
-  return !!data;
 }
 
 async function notifyDoctor(patient: HumanPatient, content: string) {
@@ -75,9 +61,7 @@ async function notifyDoctor(patient: HumanPatient, content: string) {
       id = await sendWhatsAppTemplate(admin, template, [await clinicName()]);
     }
   }
-  await db.from('escalation_mappings').insert({
-    wa_message_id: id, patient_phone: patient.phone, human_session_id: patient.human_session_id,
-  }).throwOnError();
+  await trackHumanChatReply(id, patient);
   return true;
 }
 
@@ -122,10 +106,8 @@ export async function handlePatientMessage(message: IncomingMessage) {
   }
 
   if (optionId === 'doctor' || optionId === 'urgencia' || humanRequest.test(text) || text === 'atencion prioritaria') {
-    const sessionId = randomUUID();
-    const { data } = await db.from('patients').update({ chat_mode: 'WAITING_HUMAN', human_session_id: sessionId })
-      .eq('phone', from).eq('chat_mode', 'AI_ACTIVE').select('phone').maybeSingle().throwOnError();
-    if (!data) return;
+    const sessionId = await openHumanChat(from);
+    if (!sessionId) return;
     const session = { ...patient, human_session_id: sessionId };
     const notified = await notifyDoctor(session, 'Solicitó hablar con el equipo.').catch(async error => {
       await closeHumanChat(session);
@@ -192,6 +174,13 @@ export async function handlePatientMessage(message: IncomingMessage) {
   await runPatientAgent(from, fullName, content, reply);
 }
 
+async function finishHumanChat(admin: string, patient: HumanPatient & { last_inbound_at: string | null }) {
+  if (!await closeHumanChat(patient)) return sendWhatsAppText(admin, 'Esa conversación ya está cerrada.');
+  await sendWhatsAppText(admin, 'Conversación cerrada.');
+  if (hasWhatsAppWindow(patient.last_inbound_at)) await sendWhatsAppText(patient.phone, `El equipo cerró la conversación. Soy ${await botName()} y vuelvo a atenderte.`)
+    .catch(error => { if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error; });
+}
+
 const adminPrompts: Record<string, string> = {
   admin_cancelar: 'Dime la fecha y el nombre o la hora de la cita. Por ejemplo, «Corrige el WhatsApp de la cita de Ana de mañana a las 4 p. m.» o «Cancela la cita de hoy a las 5 p. m.».',
   admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
@@ -207,6 +196,13 @@ export async function handleAdminMessage(message: IncomingMessage) {
   const inboundAt = inboundTime(message.timestamp);
   await db.from('bot_settings').update({ admin_last_inbound_at: inboundAt }).eq('id', 1)
     .or(`admin_last_inbound_at.is.null,admin_last_inbound_at.lt.${inboundAt}`).throwOnError();
+  const close = optionId?.match(/^chat_close_([1-9]\d{7,14})_([a-f0-9-]{36})$/);
+  if (close) {
+    const { data: patient } = await db.from('patients').select('phone,full_name,chat_mode,human_session_id,last_inbound_at')
+      .eq('phone', close[1]).eq('human_session_id', close[2]).maybeSingle().throwOnError();
+    if (!patient) return void await sendWhatsAppText(from, 'Esa conversación ya está cerrada.');
+    return void await finishHumanChat(from, patient);
+  }
   if (contextMessageId && !optionId) {
     const { data: mapping } = await db.from('escalation_mappings').select('patient_phone,human_session_id')
       .eq('wa_message_id', contextMessageId).maybeSingle().throwOnError();
@@ -217,17 +213,11 @@ export async function handleAdminMessage(message: IncomingMessage) {
         await sendWhatsAppText(from, 'Esa conversación ya está cerrada.');
         return;
       }
-      const expired = patient.last_inbound_at && Date.now() - Date.parse(patient.last_inbound_at) >= 86_400_000;
       if (closeRequests.has(text)) {
-        if (await closeHumanChat(patient)) {
-          await sendWhatsAppText(from, 'Conversación cerrada.');
-          if (!expired) await sendWhatsAppText(patient.phone, `El equipo cerró la conversación. Soy ${await botName()} y vuelvo a atenderte.`)
-            .catch(error => { if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error; });
-        }
-        return;
+        return void await finishHumanChat(from, patient);
       }
       try {
-        if (expired) throw new WhatsAppError(400, 131047);
+        if (!hasWhatsAppWindow(patient.last_inbound_at)) throw new WhatsAppError(400, 131047);
         await sendWhatsAppText(patient.phone, content);
       } catch (error) {
         if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error;
@@ -243,6 +233,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (await handleAppointmentAction(from, optionId, true)) return;
   if (await handleTreatmentEditor(from, optionId, content, contextMessageId)) return;
   if (optionId === 'admin_panel') return showAdminMenu(from);
+  if (optionId === 'adm_treatment_menu') return showAdminTreatmentMenu(from);
   if (optionId === 'adm_faq_menu') return showAdminFaqMenu(from);
   if (await handleAdminWaitlist(from, optionId, contextMessageId ? '' : text)) return;
   if (await handleClinicAdministration(from, optionId, content, contextMessageId)) return;
