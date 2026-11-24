@@ -11,6 +11,7 @@ import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { handleTreatmentEditor } from '@/lib/treatment-editor';
 import { handleWaitlistOffer } from '@/lib/waitlist';
 import { handleAdminWaitlist } from '@/lib/waitlist-admin';
+import { handleClinicAdministration, showPatientBalance } from '@/lib/clinic-admin';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
@@ -64,14 +65,14 @@ async function notifyDoctor(patient: HumanPatient, content: string) {
   let id: string;
   if (outsideWindow) {
     if (!template) return false;
-    id = await sendWhatsAppTemplate(admin, template, [clinicName()]);
+    id = await sendWhatsAppTemplate(admin, template, [await clinicName()]);
   } else {
     try {
       id = await sendWhatsAppText(admin, `🩺 *Atención por WhatsApp*\n${patient.full_name || 'Paciente'}\n\n${content}\n\nDesliza este mensaje para responder o escribe «cerrar» como respuesta.`);
     } catch (error) {
       if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error;
       if (!template) return false;
-      id = await sendWhatsAppTemplate(admin, template, [clinicName()]);
+      id = await sendWhatsAppTemplate(admin, template, [await clinicName()]);
     }
   }
   await db.from('escalation_mappings').insert({
@@ -140,6 +141,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
   }
 
   const fullName = patient.full_name?.trim();
+  if (optionId === 'my_debts' || (!optionId && /^(?:mis deudas|mi saldo)$/.test(text))) return showPatientBalance(from);
   const treatmentOption = optionId?.match(/^book_trt_(\d{1,9})$/);
   if (treatmentOption) {
     const treatment = await treatmentName(Number(treatmentOption[1]));
@@ -159,7 +161,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
     if (optionId) return;
     const name = !inserted || /^(?:soy|me llamo|mi nombre es)\s/.test(text) ? parseName(content) : null;
     if (!name) {
-      await reply(inserted ? `Hola, soy *${botName()}*, de *${clinicName()}*. ¿Cómo te llamas?` : '¿Cómo te llamas?');
+      await reply(inserted ? `Hola, soy *${await botName()}*, de *${await clinicName()}*. ¿Cómo te llamas?` : '¿Cómo te llamas?');
       return;
     }
     let update = db.from('patients').update({ full_name: name, onboarding_completed: true }).eq('phone', from);
@@ -169,7 +171,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
     return;
   }
   if (await handleAppointmentAction(from, optionId, false)) return;
-  if (optionId === 'menu_principal' || (!optionId && menuRequests.has(text))) return showPatientMenu(from);
+  if (optionId === 'menu_principal' || (!optionId && menuRequests.has(text))) return showPatientMenu(from, text === 'hola' ? fullName : undefined);
   if (optionId === 'menu_tratamientos' || ['tratamientos', 'tratamientos y precios', 'tratamientos/precios'].includes(text)) return showCatalog(from, 'treatments');
   if (optionId === 'menu_faqs' || ['preguntas frecuentes', 'info y politicas'].includes(text)) return showCatalog(from, 'faqs');
   const catalogOption = optionId?.match(/^(trt|faq)_(page_)?(\d{1,9})$/);
@@ -218,7 +220,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
       if (closeRequests.has(text)) {
         if (await closeHumanChat(patient)) {
           await sendWhatsAppText(from, 'Conversación cerrada.');
-          if (!expired) await sendWhatsAppText(patient.phone, `El equipo cerró la conversación. Soy ${botName()} y vuelvo a atenderte.`)
+          if (!expired) await sendWhatsAppText(patient.phone, `El equipo cerró la conversación. Soy ${await botName()} y vuelvo a atenderte.`)
             .catch(error => { if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error; });
         }
         return;
@@ -242,6 +244,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (optionId === 'admin_panel') return showAdminMenu(from);
   if (optionId === 'adm_faq_menu') return showAdminFaqMenu(from);
   if (await handleAdminWaitlist(from, optionId, contextMessageId ? '' : text)) return;
+  if (await handleClinicAdministration(from, optionId, content, contextMessageId)) return;
   const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
   if (taskPage || (!optionId && /^(?:ver |lista de |mis )?pendientes$/.test(text))) {
     return showPendingTasks(from, Number(taskPage?.[1] || 0));

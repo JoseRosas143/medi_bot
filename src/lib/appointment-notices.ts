@@ -38,7 +38,7 @@ export async function sendAppointmentNotice(appointment: CalendarEventData, kind
 
   try {
     const id = await sendWhatsAppTemplate(appointment.patientPhone, name, [
-      appointmentPatientName(appointment.summary), clinicName(), formatAppointment(appointment.start),
+      appointmentPatientName(appointment.summary), await clinicName(), formatAppointment(appointment.start),
     ]);
     await db.from('appointment_notices').update({
       state: 'accepted', wa_message_id: id, updated_at: new Date().toISOString(),

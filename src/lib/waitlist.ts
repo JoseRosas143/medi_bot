@@ -132,7 +132,7 @@ async function sendOffer(opening: Opening, inWindow: boolean, approved?: string)
     }
   }
   if (!approved) throw new Error('Waitlist template is missing');
-  await sendWhatsAppTemplate(phone, approved, [clinicName(), when], [accept, pass]);
+  await sendWhatsAppTemplate(phone, approved, [await clinicName(), when], [accept, pass]);
 }
 
 async function dispatchOpening(opening: Opening) {
@@ -221,7 +221,7 @@ async function completeMove(opening: Opening, entry: Entry) {
   await requests().delete().eq('event_id', entry.event_id).eq('id', entry.id).throwOnError();
   const released = await queueOpening({ eventId: entry.event_id, patientPhone: entry.phone, summary: '', ...entrySlot(entry) });
   try {
-    await sendWhatsAppText(entry.phone, `✅ *Cita adelantada*\n${formatAppointment(opening.start_at)}\n\n${formatVisitLocation()}`);
+    await sendWhatsAppText(entry.phone, `✅ *Cita adelantada*\n${formatAppointment(opening.start_at)}\n\n${await formatVisitLocation()}`);
   } finally {
     if (released) await dispatchOpening(released);
   }

@@ -3,13 +3,13 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { registerHooks } from 'node:module';
 import { test } from 'node:test';
 
-const databaseUrl = 'data:text/javascript,export const supabaseAdmin=globalThis.testDatabase';
+const databaseUrl = 'data:text/javascript,export const supabaseAdmin={from:(...args)=>globalThis.testDatabase.from(...args),rpc:(...args)=>globalThis.testDatabase.rpc(...args)}';
 const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogle';
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
   export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
     cancelCalendarEvent, getPatientAppointments, findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, appointmentPatientName,
     getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot,
-    saveCalendarAppointmentContact, recordCalendarVisit } = globalThis.testCalendar;
+    saveCalendarAppointmentContact, recordCalendarVisit, getPatientVisitHistory } = globalThis.testCalendar;
 `);
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -46,6 +46,12 @@ const lastInbounds = new Map();
 let adminLastInbound = null;
 const clinicTasks = new Map();
 let taskReminderTemplate = null;
+const config = {};
+const balances = new Map();
+const ledgerIds = new Set();
+const clinicDrafts = new Map();
+const defaultHours = () => Array.from({ length: 7 }, (_, weekday) => ({ weekday, opens_at: '09:00', closes_at: '19:00' }));
+let clinicHours = defaultHours();
 const createdAppointments = [];
 let upcomingAppointments = [];
 const events = new Map();
@@ -101,16 +107,18 @@ const calendarSlots = ['16:00', '17:00', '18:00'].map(hour => ({
   end: `2099-11-20T${hour.replace(':00', ':45')}:00-06:00`,
   label: `Viernes a las ${hour}`,
 }));
+let proposedDate = null;
 globalThis.testCalendar = {
   getUpcomingSlots: async (_after, duration) => duration ? calendarSlots.map(slot => ({
     ...slot, end: new Date(Date.parse(slot.start) + duration).toISOString(),
   })) : calendarSlots,
-  getAvailableSlots: async date => ({ date, slots: calendarSlots }),
+  getAvailableSlots: async date => { proposedDate = date; return { date, slots: calendarSlots }; },
   createCalendarAppointment: async params => {
     createdAppointments.push(params);
     return calendarSlots.find(slot => slot.start === params.startTime);
   },
   getPatientAppointments: liveCalendar.getPatientAppointments,
+  getPatientVisitHistory: liveCalendar.getPatientVisitHistory,
   findUpcomingAppointmentsByWhatsApp: liveCalendar.findUpcomingAppointmentsByWhatsApp,
   getAppointmentsByDateRange: async (...args) => events.size ? liveCalendar.getAppointmentsByDateRange(...args) : upcomingAppointments,
   getCalendarAppointment: liveCalendar.getCalendarAppointment,
@@ -148,6 +156,10 @@ function query(table) {
     },
     eq: (field, value) => { filters[field] = value; return chain; },
     in: (field, choices) => { constraints.push(row => choices.includes(row[field])); return chain; },
+    ilike: (field, value) => {
+      constraints.push(row => row[field]?.toLowerCase().includes(value.slice(1, -1).toLowerCase()));
+      return chain;
+    },
     lt: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) < value); return chain; },
     lte: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) <= value); return chain; },
     not: (field, _operator, value) => {
@@ -166,7 +178,31 @@ function query(table) {
     throwOnError: () => chain,
     then: resolve => {
       if (table === 'bot_settings' && operation === 'select') {
-        return resolve({ data: { task_reminder_template: taskReminderTemplate, admin_last_inbound_at: adminLastInbound }, error: null });
+        return resolve({ data: { task_reminder_template: taskReminderTemplate, admin_last_inbound_at: adminLastInbound, ...config }, error: null });
+      }
+      if (table === 'bot_settings' && operation === 'update' && (values.bot_name || values.clinic_name)) {
+        Object.assign(config, values);
+        return resolve({ data: { id: 1 }, error: null });
+      }
+      if (table === 'clinic_weekly_hours') {
+        if (operation === 'update') {
+          const day = clinicHours.find(item => item.weekday === filters.weekday);
+          Object.assign(day, values);
+          return resolve({ data: day, error: null });
+        }
+        return resolve({ data: clinicHours, error: null });
+      }
+      if (table === 'clinic_admin_inputs') {
+        if (operation === 'upsert') {
+          clinicDrafts.set(values.actor_phone, { ...values });
+          return resolve({ data: null, error: null });
+        }
+        const row = clinicDrafts.get(filters.actor_phone);
+        if (!row || !Object.entries(filters).every(([field, value]) => row[field] === value) ||
+            !constraints.every(check => check(row))) return resolve({ data: null, error: null });
+        if (operation === 'update') Object.assign(row, values);
+        if (operation === 'delete') clinicDrafts.delete(filters.actor_phone);
+        return resolve({ data: { ...row }, error: null });
       }
       if (table === 'calendar_booking_lock') {
         if (operation === 'insert') {
@@ -317,8 +353,11 @@ function query(table) {
         return resolve({ data: reminderReplies.get(filters.wa_message_id) || null, error: null });
       }
       if (table === 'patients' && operation === 'select') {
+        if (!filters.phone) return resolve({ data: [...patientNames.entries()].map(([phone, full_name]) => ({ phone, full_name }))
+          .filter(row => constraints.every(check => check(row))).slice(0, limit) });
         return resolve({ data: {
           phone: filters.phone, full_name: patientNames.get(filters.phone) ?? 'Ana Demo',
+          last_inbound_at: lastInbounds.get(filters.phone),
           chat_mode: 'AI_ACTIVE', human_session_id: null,
         } });
       }
@@ -336,7 +375,18 @@ function query(table) {
   return chain;
 }
 const readField = (row, field) => field.split('.').reduce((value, part) => value?.[part], row);
-globalThis.testDatabase = { from: query, rpc: () => ({ throwOnError: async () => ({ error: null }) }) };
+globalThis.testDatabase = { from: query, rpc: (name, args) => ({ throwOnError: async () => {
+  if (name === 'patient_account_balance') return { data: balances.get(args.p_phone) || 0 };
+  if (name === 'record_patient_account_entry') {
+    if (ledgerIds.has(args.p_id)) return { data: 'duplicate' };
+    const total = (balances.get(args.p_phone) || 0) + args.p_delta;
+    if (total < 0) return { data: 'insufficient' };
+    ledgerIds.add(args.p_id);
+    balances.set(args.p_phone, total);
+    return { data: 'saved' };
+  }
+  return { error: null };
+} }) };
 globalThis.fetch = async (url, options) => {
   assert.match(String(url), /^https:\/\/graph\.facebook\.com\//);
   metaRequests.push(JSON.parse(options.body));
@@ -427,6 +477,99 @@ function lastButtons() {
   const { buttons, sections } = metaRequests.at(-1).interactive.action;
   return buttons ? buttons.map(button => button.reply.id) : sections.flatMap(section => section.rows.map(row => row.id));
 }
+
+async function confirmAdminInput(option, value, tag, admin = process.env.ADMIN_PHONE_NUMBER) {
+  await webhook([answerButton(`open-clinic-input-${tag}`, option, admin)]);
+  const prompt = `mock_${metaRequests.length}`;
+  await webhook([{ ...textMessage(`reply-clinic-input-${tag}`, value, admin), context: { id: prompt } }]);
+  const confirm = lastButtons()[0];
+  await webhook([answerButton(`save-clinic-input-${tag}`, confirm, admin)]);
+  return confirm;
+}
+
+test('admin can rename the clinic and bot, and returning patients see the configured clinic and their own name', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  try {
+    await webhook([answerButton('open-configuration-test', 'admin_config', admin)]);
+    assert.ok(lastButtons().includes('setup_bot_name'));
+    await confirmAdminInput('setup_clinic_name', 'Clínica Demo', 'clinic-name');
+    await confirmAdminInput('setup_bot_name', 'Bot Demo', 'bot-name');
+    assert.equal(config.bot_name, 'Bot Demo');
+    await webhook([textMessage('returning-clinic-greeting-test', 'Hola', patient)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Clínica Demo[\s\S]*Hola de nuevo, Ana Demo/);
+    assert.ok(lastButtons().includes('my_debts'));
+  } finally {
+    delete config.clinic_name;
+    delete config.bot_name;
+    clinicDrafts.clear();
+  }
+});
+
+test('weekly hours constrain Calendar slots and patients can propose a specific date', async () => {
+  clinicHours = defaultHours().map(day => ({ ...day, opens_at: [1, 2, 4, 5].includes(day.weekday) ? '13:00' : null,
+    closes_at: [1, 2, 4, 5].includes(day.weekday) ? '17:00' : null }));
+  try {
+    assert.equal((await liveCalendar.getAvailableSlots('2099-11-18')).closed, true);
+    await confirmAdminInput('setup_day_5', '14:00-17:00', 'hours');
+    const { slots } = await liveCalendar.getAvailableSlots('2099-11-20');
+    assert.equal(slots[0].start, '2099-11-20T20:00:00.000Z');
+    assert.equal(slots.at(-1).end, '2099-11-20T23:00:00.000Z');
+    await webhook([answerButton('book-to-propose-date', 'agendar', patient)]);
+    await webhook([answerButton('propose-a-date-test', lastButtons().find(id => id.endsWith('_date')), patient)]);
+    await webhook([textMessage('reject-time-without-date', '15:00', patient)]);
+    assert.match(metaRequests.at(-1).text.body, /Escribe la fecha/);
+    await webhook([textMessage('lookup-proposed-date-test', '20/11/2099', patient)]);
+    assert.equal(proposedDate, '2099-11-20');
+    assert.match(metaRequests.at(-1).interactive.body.text, /Horarios disponibles/);
+  } finally {
+    clinicHours = defaultHours();
+    bookingDrafts.delete(patient);
+    clinicDrafts.clear();
+  }
+});
+
+test('admin CRM searches, sends a confirmed message and adjusts a balance without exposing it to another patient', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const other = '525500000088';
+  patientNames.set(patient, 'Ana Demo');
+  patientNames.set(other, 'Otra Persona');
+  lastInbounds.set(patient, new Date(Date.now() - 1000).toISOString());
+  try {
+    await webhook([textMessage('admin-crm-search-test', 'Buscar paciente Ana', admin)]);
+    assert.deepEqual(lastButtons(), [`crm_view_${patient}`]);
+    await webhook([answerButton('admin-crm-record-test', lastButtons()[0], admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo[\s\S]*Próxima cita/);
+    const visit = seedWaitlistAppointment('crm-past-visit', patient, '16');
+    visit.start.dateTime = new Date(Date.now() - 86_400_000).toISOString();
+    visit.end.dateTime = new Date(Date.parse(visit.start.dateTime) + 2_700_000).toISOString();
+    Object.assign(visit.extendedProperties.private, { visitStatus: 'arrived', visitStatusFor: visit.start.dateTime });
+    await webhook([answerButton('admin-crm-visit-results', `crm_visits_${patient}`, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Llegó 1 · No asistió 0/);
+    await confirmAdminInput(`crm_message_${patient}`, 'Hola desde recepción.', 'crm-message');
+    assert.equal(metaRequests.at(-2).to, patient);
+    assert.equal(metaRequests.at(-2).text.body, 'Hola desde recepción.');
+    lastInbounds.delete(patient);
+    await confirmAdminInput(`crm_message_${patient}`, 'Este mensaje debe esperar.', 'crm-message-closed');
+    assert.match(metaRequests.at(-1).text.body, /La ventana de WhatsApp está cerrada/);
+    assert.ok(!metaRequests.some(entry => entry.to === patient && entry.text?.body === 'Este mensaje debe esperar.'));
+    const charge = await confirmAdminInput(`crm_charge_${patient}`, '500 Consulta', 'crm-charge');
+    await webhook([answerButton('replay-crm-charge-button', charge, admin)]);
+    assert.equal(balances.get(patient), 50_000);
+    await confirmAdminInput(`crm_payment_${patient}`, '700 Abono', 'overpayment');
+    assert.match(metaRequests.at(-1).text.body, /supera el saldo/);
+    await confirmAdminInput(`crm_payment_${patient}`, '200 Abono', 'crm-payment');
+    await webhook([answerButton('patient-balance-test', 'my_debts', patient), answerButton('other-balance-test', 'my_debts', other)]);
+    assert.match(metaRequests.at(-2).interactive.body.text, /300\.00/);
+    assert.match(metaRequests.at(-1).interactive.body.text, /\b0\.00$/);
+  } finally {
+    balances.clear();
+    ledgerIds.clear();
+    clinicDrafts.clear();
+    patientNames.clear();
+    lastInbounds.clear();
+    events.clear();
+  }
+});
 
 function seedWaitlistAppointment(id, phone, hour) {
   const event = {
@@ -1050,7 +1193,7 @@ test('a clinic echo, delivery status, or stale reply cannot reopen the menu', as
 test('a time change invalidates the previous confirmation and creates only the selected appointment', async () => {
   const before = metaRequests.length;
   await webhook([answerButton('book-from-treatment', 'book_trt_3')]);
-  assert.equal(lastButtons().length, 3);
+  assert.equal(lastButtons().length, 4);
   assert.match(metaRequests.at(-1).interactive.body.text, /16:00[\s\S]*17:00/);
   await webhook([answerButton('first-slot', lastButtons()[0])]);
   assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo/);

@@ -5,7 +5,7 @@ import { findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, type Ca
 import { clinicDate, clinicDayRange, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
 import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
-import { findCatalogEntries, normalized, showAdminMenu, showList, type Catalog } from '@/lib/menus';
+import { botName, findCatalogEntries, normalized, showAdminMenu, showList, type Catalog } from '@/lib/menus';
 import { visitStatusLabel } from '@/lib/reception';
 import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
@@ -140,7 +140,7 @@ async function manageCatalog(args: CatalogRequest) {
 export async function runAdminAgent(from: string, content: string) {
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12_000, maxRetries: 0 });
   const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: `Eres Benson, el asistente operativo interno. En la clínica hoy es ${clinicDate()} y la hora local es ${formatAppointment(new Date().toISOString())}.
+    { role: 'system', content: `Eres ${await botName()}, el asistente operativo interno. En la clínica hoy es ${clinicDate()} y la hora local es ${formatAppointment(new Date().toISOString())}.
 Usa las herramientas para consultar agenda, corregir el WhatsApp de una cita, preparar cancelaciones, gestionar tratamientos y FAQs y anotar, mostrar o completar pendientes. Solo modifica registros a petición explícita. Para programar un recordatorio, usa el día y la hora que pidió el administrador, interpretados en la zona horaria local. Si falta el día, la hora o el número de un pendiente existente, pide ese dato en un solo mensaje y no inventes valores. Si quiere ver la lista, usa list_tasks. Para corregir el WhatsApp de una cita o cancelarla, usa find_cancellation. Pide fecha y nombre u hora si faltan, nunca el ID. Si hay varias coincidencias, muestra sus horarios y pide el nombre y horario en un mismo mensaje. La acción elegida en WhatsApp confirma el cambio. Comunica errores o datos faltantes sin declarar acciones completadas antes de su resultado. Responde breve, en español.` },
     { role: 'user', content },
   ];

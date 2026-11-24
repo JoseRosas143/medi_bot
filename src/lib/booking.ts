@@ -7,7 +7,7 @@ import { appointmentMatchesSlot, findCalendarBooking, getAvailableSlots, getCale
 import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
 import { offerReleasedAppointment } from '@/lib/waitlist';
-import { normalized } from '@/lib/menus';
+import { normalized, showList } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
 type Slot = Awaited<ReturnType<typeof getUpcomingSlots>>[number];
@@ -18,6 +18,7 @@ type Details = {
   patientPhone?: string;
   reason?: string;
   original?: CalendarEventData;
+  awaitingDate?: boolean;
 };
 type Stage = 'search' | 'options' | 'name' | 'contact' | 'reason' | 'confirm' | 'processing' | 'confirmed';
 type Draft = { actor_phone: string; id: string; revision: string; stage: Stage; details: Details; expires_at: string };
@@ -65,9 +66,11 @@ function formatSlot(slot: Slot) {
   return slotRange.formatRange(new Date(slot.start), new Date(slot.end));
 }
 
-function requestedSchedule(text: string, tentativeDate: string): Preference | null {
+function requestedSchedule(text: string, tentativeDate: string, requireDate = false): Preference | null {
   const standard = normalized(text).replace(/[¿?]/g, '');
-  const explicitDate = standard.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0];
+  const numericDate = standard.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/);
+  const explicitDate = standard.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0] ??
+    (numericDate ? `${numericDate[3]}-${numericDate[2].padStart(2, '0')}-${numericDate[1].padStart(2, '0')}` : undefined);
   const weekdays = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
   const namedDay = standard.match(/\b(domingo|lunes|martes|miercoles|jueves|viernes|sabado)\b/)?.[0];
   const today = clinicDate();
@@ -83,6 +86,7 @@ function requestedSchedule(text: string, tentativeDate: string): Preference | nu
     const parsed = new Date(`${day}T00:00:00Z`);
     if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day) return null;
   }
+  if (requireDate && !day) return null;
   // Prefer the explicit hour after “a las” or a full HH:MM over numbers in dates.
   const timeMatch = standard.match(/\ba (?:la|las)\s+(\d{1,2})(?::([0-5]\d))?\s*(a\.?\s*m\.?|p\.?\s*m\.?)?\b/)
     || standard.match(/\b(\d{1,2}):([0-5]\d)\s*(a\.?\s*m\.?|p\.?\s*m\.?)?\b/)
@@ -100,7 +104,7 @@ function requestedSchedule(text: string, tentativeDate: string): Preference | nu
 
 async function offer(draft: Draft, preference?: Preference | null, after?: number) {
   const phone = draft.actor_phone;
-  const next = await replaceDraft(draft, 'search', { ...draft.details, options: undefined, selected: undefined });
+  const next = await replaceDraft(draft, 'search', { ...draft.details, options: undefined, selected: undefined, awaitingDate: undefined });
   if (!next) return stale(phone);
   let slots: Slot[];
   let preferred: Slot | undefined;
@@ -119,7 +123,7 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
     if (!slots.length) {
       const nextDay = nextDate(preference.date);
       slots = otherSlots(await getUpcomingSlots(clinicInstant(nextDay, '00:00').getTime() - 1, duration));
-      label = 'No encontré espacios para ese día. ';
+      label = day.closed ? 'La clínica está cerrada ese día. ' : 'No encontré espacios para ese día. ';
     }
   } else {
     slots = otherSlots(await getUpcomingSlots(after, duration));
@@ -127,18 +131,19 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
   const options = chooseSlots(slots, preferred?.start);
   const updated = await replaceDraft(next, 'options', { ...next.details, options });
   if (!updated) return stale(phone);
+  const propose = { id: buttonId(updated, 'date'), title: 'Proponer día' };
   if (!options.length) {
-    await sendWhatsAppText(phone, 'No encontré horarios en las próximas dos semanas. Puedes indicar otra fecha o hablar con la clínica.');
+    await sendWhatsAppInteractiveButtons({ to: phone, bodyText: `${label}No encontré horarios cercanos. Puedes indicar otra fecha.`, buttons: [propose] });
     return;
   }
-  await sendWhatsAppInteractiveButtons({
-    to: phone,
-    bodyText: `🗓️ *Horarios disponibles*\n${original ? `Cita actual: ${formatAppointment(original.start)}\n` : ''}${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${formatSlot(slot)}`).join('\n')}`,
-    buttons: [
-      ...options.map((slot, index) => ({ id: buttonId(updated, String(index)), title: shortSlot.format(new Date(slot.start)) })),
-      { id: buttonId(updated, 'more'), title: 'Ver otros horarios' },
-    ],
-  });
+  const body = `🗓️ *Horarios disponibles*\n${original ? `Cita actual: ${formatAppointment(original.start)}\n` : ''}${label}Elige un horario.\n\n${options.map((slot, index) => `${index + 1}. ${formatSlot(slot)}`).join('\n')}`;
+  const choices = [
+    ...options.map((slot, index) => ({ id: buttonId(updated, String(index)), title: shortSlot.format(new Date(slot.start)) })),
+    propose, { id: buttonId(updated, 'more'), title: 'Ver otros horarios' },
+  ];
+  if (choices.length <= 3) await sendWhatsAppInteractiveButtons({ to: phone, bodyText: body, buttons: choices });
+  else await showList(phone, body, 'Ver horarios', [{ title: 'Horarios y opciones', rows: choices }],
+    'Puedes escribir «1», «2», «Proponer día» u «Otros horarios».');
 }
 
 export async function startBooking(phone: string, isAdmin: boolean, patientName?: string | null, treatment?: string, request?: string) {
@@ -243,7 +248,7 @@ async function markConfirmed(draft: Draft) {
   const moved = Boolean(original);
   const status = moved ? 'Cita reagendada' : 'Cita confirmada';
   const attendance = moved ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : '';
-  const location = draft.details.patientPhone === draft.actor_phone ? `\n\n${formatVisitLocation()}` : '';
+  const location = draft.details.patientPhone === draft.actor_phone ? `\n\n${await formatVisitLocation()}` : '';
   try {
     await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(selected)}${attendance}${location}`);
   } finally {
@@ -302,7 +307,7 @@ async function confirm(draft: Draft) {
 }
 
 export async function handleBooking(phone: string, option: string | undefined, content: string): Promise<boolean> {
-  const button = option?.match(/^booking_([\da-f-]{36})_(0|1|more|name|edit|confirm|leave)$/i);
+  const button = option?.match(/^booking_([\da-f-]{36})_(0|1|more|date|name|edit|confirm|leave)$/i);
   if (option && !button) return false;
   const draft = await readDraft(phone);
   if (!draft || (!current(draft) && draft.stage !== 'processing')) {
@@ -321,11 +326,23 @@ export async function handleBooking(phone: string, option: string | undefined, c
   const text = normalized(content);
   const isScheduling = ['options', 'confirm', 'confirmed', 'search'].includes(draft.stage)
     || /^(?:[¿?]*(?:hay|puede|podria|prefiero|mejor|cambia|a las)\b|\d{4}-\d{2}-\d{2})/.test(text);
-  const preference = !button && isScheduling ? requestedSchedule(content, reference ? clinicDate(new Date(reference.start)) : clinicDate()) : null;
+  const preference = !button && isScheduling
+    ? requestedSchedule(content, reference ? clinicDate(new Date(reference.start)) : clinicDate(), draft.details.awaitingDate)
+    : null;
   const wantsAnother = button?.[2] === 'more' || /^(?:ver )?(?:otros horarios|cambiar horario|otra hora|otra fecha)$/.test(text);
   if (draft.stage === 'confirmed') {
     if (!preference && !wantsAnother) return false;
     await sendWhatsAppText(phone, `Tu cita ya está confirmada para ${reference?.label}. Puedes verla en «Mis citas» antes de reservar otra.`);
+    return true;
+  }
+  const datePrompt = 'Escribe la fecha que prefieres, por ejemplo «jueves» o «26/11/2026».';
+  if (draft.stage === 'options' && (button?.[2] === 'date' || (!button && text === 'proponer dia'))) {
+    const updated = await replaceDraft(draft, 'options', { ...draft.details, awaitingDate: true, options: undefined });
+    if (updated) await sendWhatsAppText(phone, datePrompt);
+    return true;
+  }
+  if (draft.details.awaitingDate && !wantsAnother && (!preference || preference.date < clinicDate())) {
+    await sendWhatsAppText(phone, datePrompt);
     return true;
   }
   if ((preference && draft.stage !== 'contact') || wantsAnother || draft.stage === 'search') {

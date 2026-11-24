@@ -1,5 +1,7 @@
+import { clinicIdentity } from '@/lib/clinic-configuration';
+
 export const CLINIC_TIMEZONE = process.env.CLINIC_TIMEZONE || 'America/Mexico_City';
-export const clinicName = () => process.env.CLINIC_NAME || 'J R Dental';
+export const clinicName = async () => (await clinicIdentity()).clinic;
 
 export function clinicDate(value: Date = new Date()): string {
   const parts = new Intl.DateTimeFormat('en', {

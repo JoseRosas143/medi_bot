@@ -31,7 +31,7 @@ Supabase registra el resultado de cada intento en `appointment_notices`. Una sol
 
 ## Pendientes y recordatorios internos
 
-Desde el número administrador, abre **Ayuda → Ver pendientes** o escribe **Pendientes**. El panel muestra los pendientes abiertos y sus avisos. Escribe «Pendiente #42» para ver el detalle o «Completar #42» para cerrarlo.
+Desde el número administrador, abre **Ayuda → Pendientes → Ver pendientes** o escribe **Pendientes**. El panel muestra los pendientes abiertos y sus avisos. Escribe «Pendiente #42» para ver el detalle o «Completar #42» para cerrarlo.
 
 - Para crear con aviso, escribe «Anota pedir guantes y recuérdamelo mañana a las 9:00».
 - Para uno existente, escribe «Recuérdame el pendiente #42 mañana a las 9:00».
@@ -47,6 +47,12 @@ Desde **Mis citas → Lista de espera → Pedir adelantar**, el paciente solicit
 Las reservas nuevas hechas por pacientes generan un aviso a recepción. Si la cita es para el día en curso, el aviso indica **Para hoy**. Las reservas hechas por recepción se confirman en el propio chat de administración.
 
 Aplica la migración `appointment_waitlist` antes de desplegar. Consulta las plantillas con `node --env-file=.env.local scripts/meta-templates.mjs --booking-alerts` y agrega `--submit` para solicitar aprobación. Una vez aprobadas, registra `cita_adelanto_lista_espera` en `bot_settings.waitlist_template` y `cita_nueva_recepcion` en `bot_settings.admin_booking_template`, ambas en el registro `id = 1`. Las variables de Vercel `WHATSAPP_WAITLIST_TEMPLATE` y `WHATSAPP_ADMIN_BOOKING_TEMPLATE` tienen prioridad. Mientras se revisan, Benson puede enviar estos avisos a destinatarios con una ventana de WhatsApp abierta.
+
+## Horario de atención y CRM
+
+Aplica la migración `clinic_admin_and_patient_balances` antes de desplegar. En **Ayuda → Configuración** se pueden cambiar los nombres y editar cada día de la semana. El horario inicial es lunes, martes, jueves y viernes de 13:00 a 17:00 en la zona de la clínica. Benson combina este horario con los eventos ocupados de Calendar antes de ofrecer o confirmar citas.
+
+En **Ayuda → Pacientes · CRM** escribe «Buscar paciente» seguido de un nombre o número. Desde su ficha puedes ver citas y asistencia, escribirle dentro de la ventana de WhatsApp y registrar cargos o abonos en MXN con confirmación. El paciente consulta su propio saldo en **Mis deudas**.
 
 ## Verificación
 
