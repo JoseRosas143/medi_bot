@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { formatPrice, formatTreatmentDetail, normalized, showList, type TreatmentCard } from '@/lib/menus';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppText, type WhatsAppListSection } from '@/lib/whatsapp';
+import { parseTreatmentDuration } from '@/lib/treatment-duration';
 
-type Treatment = TreatmentCard & { id: number; is_active: boolean };
-type Field = 'description' | 'price' | 'name' | 'is_active';
+type Treatment = TreatmentCard & { id: number; is_active: boolean; duration_minutes: number };
+type Field = 'description' | 'price' | 'name' | 'is_active' | 'duration_minutes';
 type Value = string | number | boolean | null;
 type Draft = {
   revision: string; treatment_id: number; field: Field; previous_value: Value;
@@ -12,9 +13,9 @@ type Draft = {
 };
 
 const labels: Record<Field, string> = {
-  description: 'Descripción', price: 'Precio en MXN', name: 'Nombre', is_active: 'Visibilidad',
+  description: 'Descripción', price: 'Precio en MXN', name: 'Nombre', is_active: 'Visibilidad', duration_minutes: 'Duración',
 };
-const columns = 'id,name,price,description,is_active';
+const columns = 'id,name,price,description,is_active,duration_minutes';
 const expiry = () => new Date(Date.now() + 15 * 60_000).toISOString();
 const drafts = () => db.from('treatment_edit_drafts');
 const expired = (phone: string) => sendWhatsAppText(phone, 'La opción cambió o venció. Abre «Editar tratamiento» para retomar la ficha.');
@@ -49,7 +50,7 @@ async function sendChoices(phone: string, detail: string, buttons: { id: string;
 }
 
 async function showTreatment(phone: string, treatment: Treatment, saved = false) {
-  return sendChoices(phone, `${saved ? '✅ *Cambio guardado*\n\n' : ''}${formatTreatmentDetail(treatment)}\n\n_${visibility(treatment.is_active)}_`, [
+  return sendChoices(phone, `${saved ? '✅ *Cambio guardado*\n\n' : ''}${formatTreatmentDetail(treatment)}\nDuración ${treatment.duration_minutes} min\n\n_${visibility(treatment.is_active)}_`, [
     { id: `ted_fields_${treatment.id}`, title: 'Editar datos' },
     { id: `ted_is_active_${treatment.id}`, title: treatment.is_active ? 'Ocultar ficha' : 'Mostrar ficha' },
     { id: 'adm_edit_treatment', title: 'Ver tratamientos' },
@@ -58,6 +59,7 @@ async function showTreatment(phone: string, treatment: Treatment, saved = false)
 
 function display(field: Field, value: Value) {
   if (field === 'price') return formatPrice(value as number);
+  if (field === 'duration_minutes') return `${value} min`;
   if (field === 'is_active') return visibility(value === true);
   return value === null || value === '' ? 'Sin descripción' : String(value);
 }
@@ -72,6 +74,7 @@ async function showConfirmation(phone: string, name: string, draft: Draft) {
 async function beginEdit(phone: string, treatment: Treatment, field: Field) {
   const previous = treatment[field];
   const guidance = field === 'price' ? 'Escribe el nuevo precio en pesos, por ejemplo 850 o 1,250.50.'
+    : field === 'duration_minutes' ? 'Escribe los minutos de atención, entre 15 y 480, por ejemplo «60».'
     : field === 'description' ? 'Escribe la nueva descripción, hasta 600 caracteres, o «Borrar descripción».'
     : 'Escribe el nuevo nombre, hasta 250 caracteres.';
   const promptId = field === 'is_active' ? null : await sendWhatsAppText(phone,
@@ -86,6 +89,7 @@ async function beginEdit(phone: string, treatment: Treatment, field: Field) {
 
 function parseValue(field: Field, input: string): string | number | null {
   const value = input.trim();
+  if (field === 'duration_minutes') return parseTreatmentDuration(value);
   if (field === 'price') {
     if (!/^\$?\s*(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(value)) return null;
     const price = Number(value.replace(/[$,\s]/g, ''));
@@ -149,19 +153,18 @@ export async function handleTreatmentEditor(phone: string, option: string | unde
   if (!selection) return context ? handleReply(phone, context, content) : false;
   const page = selection.match(/^ted_page_(\d{1,6})$/);
   const edit = selection.match(/^ted_(save|discard)_([\da-f-]{36})$/);
-  const item = selection.match(/^ted_(card|fields|name|price|description|is_active)_([1-9]\d{0,9})$/);
+  const item = selection.match(/^ted_(card|fields|name|price|description|is_active|duration_minutes)_([1-9]\d{0,9})$/);
   if (page) await showTreatments(phone, Number(page[1]));
   else if (edit) await finishEdit(phone, edit[2], edit[1] === 'save');
   else if (item) {
     const treatment = await getTreatment(Number(item[2]));
     if (!treatment) await expired(phone);
     else if (item[1] === 'card') await showTreatment(phone, treatment);
-    else if (item[1] === 'fields') await sendWhatsAppInteractiveButtons({
-      to: phone, bodyText: `*Editar datos*\n${treatment.name}\nElige el dato que quieres cambiar.`,
-      buttons: (['description', 'price', 'name'] as const).map(field => ({
+    else if (item[1] === 'fields') await showList(phone, `*Editar datos*\n${treatment.name}\nElige el dato que quieres cambiar.`, 'Ver opciones', [{
+      title: 'Datos del tratamiento', rows: (['description', 'price', 'name', 'duration_minutes'] as const).map(field => ({
         id: `ted_${field}_${treatment.id}`, title: labels[field],
       })),
-    });
+    }]);
     else await beginEdit(phone, treatment, item[1] as Field);
   } else return false;
   return true;

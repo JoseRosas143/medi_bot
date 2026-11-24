@@ -50,6 +50,7 @@ const config = {};
 const balances = new Map();
 const ledgerIds = new Set();
 const clinicDrafts = new Map();
+const scheduleBlocks = new Map();
 const defaultHours = () => Array.from({ length: 7 }, (_, weekday) => ({ weekday, opens_at: '09:00', closes_at: '19:00' }));
 let clinicHours = defaultHours();
 const createdAppointments = [];
@@ -132,7 +133,7 @@ globalThis.testCalendar = {
 };
 const treatments = Array.from({ length: 12 }, (_, i) => ({
   id: i + 1, price: 100.5 + i, name: `Tratamiento de muestra número ${i + 1}`,
-  description: 'Descripción informativa de la clínica.', is_active: true,
+  description: 'Descripción informativa de la clínica.', is_active: true, duration_minutes: 45,
 }));
 
 function query(table) {
@@ -157,7 +158,10 @@ function query(table) {
     eq: (field, value) => { filters[field] = value; return chain; },
     in: (field, choices) => { constraints.push(row => choices.includes(row[field])); return chain; },
     ilike: (field, value) => {
-      constraints.push(row => row[field]?.toLowerCase().includes(value.slice(1, -1).toLowerCase()));
+      const pattern = value.toLowerCase();
+      constraints.push(row => pattern.startsWith('%') && pattern.endsWith('%')
+        ? row[field]?.toLowerCase().includes(pattern.slice(1, -1))
+        : row[field]?.toLowerCase() === pattern);
       return chain;
     },
     lt: (field, value) => { constraints.push(row => readField(row, field) != null && readField(row, field) < value); return chain; },
@@ -191,6 +195,17 @@ function query(table) {
           return resolve({ data: day, error: null });
         }
         return resolve({ data: clinicHours, error: null });
+      }
+      if (table === 'clinic_schedule_blocks') {
+        if (operation === 'insert') {
+          scheduleBlocks.set(values.id, { ...values });
+          return resolve({ data: null, error: null });
+        }
+        let rows = [...scheduleBlocks.values()].filter(row =>
+          Object.entries(filters).every(([key, value]) => row[key] === value) && constraints.every(check => check(row)));
+        if (range) rows = rows.slice(range[0], range[1] + 1);
+        if (operation === 'delete') rows.forEach(row => scheduleBlocks.delete(row.id));
+        return resolve({ data: singleRow ? rows[0] ?? null : rows, error: null });
       }
       if (table === 'clinic_admin_inputs') {
         if (operation === 'upsert') {
@@ -361,6 +376,10 @@ function query(table) {
           chat_mode: 'AI_ACTIVE', human_session_id: null,
         } });
       }
+      if (table === 'patients' && operation === 'update' && values.full_name && filters.phone) {
+        patientNames.set(filters.phone, values.full_name);
+        return resolve({ data: { phone: filters.phone }, error: null });
+      }
       if (table === 'chat_messages' && operation === 'insert') saved.push(values);
       if (table === 'treatments') {
         let rows = treatments.filter(row =>
@@ -486,6 +505,70 @@ async function confirmAdminInput(option, value, tag, admin = process.env.ADMIN_P
   await webhook([answerButton(`save-clinic-input-${tag}`, confirm, admin)]);
   return confirm;
 }
+
+test('configured treatment duration is offered and revalidated before creating the Calendar event', async () => {
+  const treatment = treatments[0];
+  try {
+    await confirmAdminInput('ted_duration_minutes_1', '75', 'edit-treatment-duration');
+    assert.equal(treatment.duration_minutes, 75);
+    await webhook([answerButton('book-treatment-with-duration', 'book_trt_1', patient)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /16:00[\s\S]*17:15/);
+    const params = { actionId: randomUUID(), patientName: 'Ana Demo', patientPhone: patient,
+      reason: treatment.name, treatmentId: treatment.id, startTime: '2099-11-20T22:00:00.000Z' };
+    assert.equal(await liveCalendar.createCalendarAppointment({ ...params, durationMinutes: 45 }), null);
+    const slot = await liveCalendar.createCalendarAppointment({ ...params, durationMinutes: 75 });
+    assert.equal(Date.parse(slot.end) - Date.parse(slot.start), 75 * 60_000);
+  } finally {
+    treatment.duration_minutes = 45;
+    bookingDrafts.delete(patient);
+    treatmentDrafts.clear();
+    events.clear();
+  }
+});
+
+test('admin blocks and unblocks local hours and days without changing existing Calendar appointments', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const original = seedWaitlistAppointment('existing-event-during-vacation', patient, '14');
+  try {
+    await confirmAdminInput('setup_block_hours', '2099-11-20 13:00-15:00', 'block-hours-test');
+    const { slots } = await liveCalendar.getAvailableSlots('2099-11-20');
+    const start = Date.parse('2099-11-20T19:00:00Z');
+    const end = Date.parse('2099-11-20T21:00:00Z');
+    assert.ok(slots.some(slot => Date.parse(slot.start) === end));
+    assert.ok(slots.every(slot => Date.parse(slot.end) <= start || Date.parse(slot.start) >= end));
+    const unavailable = await liveCalendar.createCalendarAppointment({ actionId: randomUUID(), patientName: 'Ana Demo',
+      patientPhone: patient, reason: 'Consulta', startTime: new Date(start).toISOString() });
+    assert.equal(unavailable, null);
+    await confirmAdminInput('setup_block_dates', '20/11/2099 a 21/11/2099', 'block-days-test');
+    assert.equal((await liveCalendar.getAvailableSlots('2099-11-21')).slots.length, 0);
+    await webhook([answerButton('view-schedule-blocks-test', 'setup_blocks_0', admin)]);
+    const id = [...scheduleBlocks.keys()].at(-1);
+    await webhook([answerButton('review-remove-schedule-block-test', `setup_block_review_${id}`, admin)]);
+    await webhook([answerButton('confirm-remove-schedule-block-test', lastButtons()[0], admin)]);
+    assert.ok((await liveCalendar.getAvailableSlots('2099-11-21')).slots.length);
+    assert.equal(events.get(original.id).start.dateTime, original.start.dateTime);
+  } finally {
+    scheduleBlocks.clear();
+    clinicDrafts.clear();
+    events.clear();
+  }
+});
+
+test('patients and reception can correct a saved name for future greetings', async () => {
+  patientNames.set(patient, 'Hoka');
+  try {
+    await webhook([answerButton('self-name-edit-start-test', 'patient_name_edit', patient)]);
+    await webhook([textMessage('self-name-edit-save-test', 'Corregir mi nombre a Ana Pérez', patient)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Hola de nuevo, Ana Pérez/);
+    await confirmAdminInput(`crm_patient_name_${patient}`, 'Ana Pérez López', 'reception-name-edit');
+    await webhook([textMessage('say-hi-after-name-edit', 'Hola', patient)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Hola de nuevo, Ana Pérez López/);
+    assert.doesNotMatch(metaRequests.at(-1).interactive.body.text, /Hoka/);
+  } finally {
+    patientNames.clear();
+    clinicDrafts.clear();
+  }
+});
 
 test('admin can rename the clinic and bot, and returning patients see the configured clinic and their own name', async () => {
   const admin = process.env.ADMIN_PHONE_NUMBER;

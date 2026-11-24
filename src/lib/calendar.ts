@@ -2,8 +2,8 @@ import { google, type calendar_v3 } from 'googleapis';
 import { clinicDate, clinicInstant, CLINIC_TIMEZONE, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { comparableWhatsApp, isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp';
 import { weeklyHours, type WeeklyHours } from '@/lib/clinic-configuration';
-
-const APPOINTMENT_MINUTES = 45;
+import { getScheduleBlocks } from '@/lib/schedule-blocks';
+import { DEFAULT_APPOINTMENT_MINUTES, getSchedulableTreatment } from '@/lib/treatment-duration';
 
 export type VisitStatus = 'arrived' | 'no_show';
 
@@ -53,7 +53,7 @@ function toAppointment(event: calendar_v3.Schema$Event): CalendarEventData | nul
 
 async function getBusySlots(start: string, end: string) {
   const { calendar, calendarId } = getCalendarClient();
-  const [response, events] = await Promise.all([
+  const [response, events, blocks] = await Promise.all([
     calendar.freebusy.query({
       requestBody: { timeMin: start, timeMax: end, timeZone: CLINIC_TIMEZONE, items: [{ id: calendarId }] },
     }, { timeout: 8_000 }),
@@ -61,10 +61,11 @@ async function getBusySlots(start: string, end: string) {
       timeMin: start, timeMax: end, eventTypes: ['default'],
       fields: 'nextPageToken,items(start/dateTime,end/dateTime,status,transparency,extendedProperties/private)',
     }),
+    getScheduleBlocks(start, end),
   ]);
   const result = response.data.calendars?.[calendarId];
   if (!result || result.errors?.length) throw new Error('No se pudo verificar disponibilidad en Calendar');
-  const busy = [...(result.busy || [])];
+  const busy = [...(result.busy || []), ...blocks.map(block => ({ start: block.starts_at, end: block.ends_at }))];
   for (const event of events) {
     if (event.status === 'cancelled' || (event.transparency === 'transparent' && !eventContact(event))) continue;
     if (event.start?.dateTime && event.end?.dateTime) busy.push({ start: event.start.dateTime, end: event.end.dateTime });
@@ -92,7 +93,7 @@ function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$T
   return slots;
 }
 
-export async function getAvailableSlots(date: string, duration = APPOINTMENT_MINUTES * 60_000) {
+export async function getAvailableSlots(date: string, duration = DEFAULT_APPOINTMENT_MINUTES * 60_000) {
   const window = workingHours(date, await weeklyHours());
   if (!window) return { date, closed: true, slots: [] };
   const { opening, closing } = window;
@@ -102,7 +103,7 @@ export async function getAvailableSlots(date: string, duration = APPOINTMENT_MIN
   return { date, slots: availableSlots(opening, closing, busy, now, duration) };
 }
 
-export async function getUpcomingSlots(after = Date.now(), duration = APPOINTMENT_MINUTES * 60_000) {
+export async function getUpcomingSlots(after = Date.now(), duration = DEFAULT_APPOINTMENT_MINUTES * 60_000) {
   const earliest = Math.max(after, Date.now());
   const week = await weeklyHours();
   const days = [];
@@ -117,11 +118,18 @@ export async function getUpcomingSlots(after = Date.now(), duration = APPOINTMEN
 
 export async function createCalendarAppointment(params: {
   actionId: string; patientName: string; patientPhone: string; startTime: string; reason: string;
+  durationMinutes?: number; treatmentId?: number;
 }) {
   const { calendar, calendarId } = getCalendarClient();
   const start = new Date(params.startTime);
   if (!Number.isFinite(start.getTime())) throw new Error('Hora inválida');
-  const availability = await getAvailableSlots(clinicDate(start));
+  const duration = params.durationMinutes ?? DEFAULT_APPOINTMENT_MINUTES;
+  if (!Number.isInteger(duration) || duration < 15 || duration > 480) throw new Error('Duración de cita inválida');
+  if (params.treatmentId !== undefined) {
+    const treatment = await getSchedulableTreatment(params.treatmentId);
+    if (!treatment || treatment.duration_minutes !== duration) return null;
+  }
+  const availability = await getAvailableSlots(clinicDate(start), duration * 60_000);
   const slot = availability.slots.find(item => item.start === start.toISOString());
   if (!slot) return null;
   const eventId = params.actionId.replaceAll('-', '');

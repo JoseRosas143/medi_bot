@@ -36,6 +36,7 @@ export async function showPatientMenu(to: string, returningName?: string) {
       { id: 'agendar', title: 'Agendar cita', description: 'Consulta horarios y reserva' },
       { id: 'cancelar', title: 'Mis citas', description: 'Consulta o cancela una cita' },
       { id: 'my_debts', title: 'Mis deudas', description: 'Consulta tu saldo registrado' },
+      { id: 'patient_name_edit', title: 'Corregir mi nombre' },
     ] },
     { title: 'La clínica', rows: [
       { id: 'menu_tratamientos', title: 'Tratamientos y precios', description: 'Explora los precios registrados' },
@@ -109,11 +110,6 @@ export type TreatmentCard = { name: string; price: number; description: string |
 
 export function formatTreatmentDetail(treatment: TreatmentCard) {
   return `🦷 *${treatment.name}*\n\n*En qué consiste*\n${treatment.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(treatment.price)}`;
-}
-
-export async function treatmentName(id: number): Promise<string | null> {
-  const { data } = await db.from('treatments').select('name').eq('id', id).eq('is_active', true).maybeSingle().throwOnError();
-  return data?.name ?? null;
 }
 
 export async function sendCatalogDetail(to: string, catalog: Catalog, id: number, detail: string) {

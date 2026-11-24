@@ -12,7 +12,9 @@ import { handleTreatmentEditor } from '@/lib/treatment-editor';
 import { handleWaitlistOffer } from '@/lib/waitlist';
 import { handleAdminWaitlist } from '@/lib/waitlist-admin';
 import { handleClinicAdministration, showPatientBalance } from '@/lib/clinic-admin';
-import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
+import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showCatalog, showPatientMenu } from '@/lib/menus';
+import { getSchedulableTreatment } from '@/lib/treatment-duration';
+import { handlePatientNameCorrection } from '@/lib/patient-name';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 export type IncomingMessage = {
@@ -141,11 +143,12 @@ export async function handlePatientMessage(message: IncomingMessage) {
   }
 
   const fullName = patient.full_name?.trim();
+  if (await handlePatientNameCorrection(from, optionId, content)) return;
   if (optionId === 'my_debts' || (!optionId && /^(?:mis deudas|mi saldo)$/.test(text))) return showPatientBalance(from);
   const treatmentOption = optionId?.match(/^book_trt_(\d{1,9})$/);
   if (treatmentOption) {
-    const treatment = await treatmentName(Number(treatmentOption[1]));
-    if (treatment) await startBooking(from, false, fullName, treatment);
+    const treatment = await getSchedulableTreatment(Number(treatmentOption[1]));
+    if (treatment) await startBooking(from, false, fullName, treatment.name, undefined, treatment.id);
     else await reply('El tratamiento salió del catálogo. Puedes elegir otro o agendar una valoración.');
     return;
   }
