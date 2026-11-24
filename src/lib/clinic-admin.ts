@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { findUpcomingAppointmentsByWhatsApp, getPatientVisitHistory } from '@/lib/calendar';
 import { clinicIdentity, parseBusinessHours, weekdays, weeklyHours } from '@/lib/clinic-configuration';
-import { formatAppointment } from '@/lib/clinic-time';
+import { formatAppointment, parseClinicDateInput } from '@/lib/clinic-time';
 import { formatPrice, normalized, showList } from '@/lib/menus';
 import { withCalendarLock } from '@/lib/calendar-lock';
 import { correctedName, savePatientName } from '@/lib/patient-name';
 import { closeHumanChat, openHumanChat, recordChatMessage, trackHumanChatReply, type HumanPatient } from '@/lib/human-chat';
 import { faqInput, findAdminFaq, isFaqAction, saveFaq, showAdminFaq, showFaqs, type FaqAction } from '@/lib/faq-admin';
-import { parseWaitlistDate, showWaitlistSlots } from '@/lib/waitlist-admin';
+import { showWaitlistSlots } from '@/lib/waitlist-admin';
 import { offerWaitlistSlot } from '@/lib/waitlist';
 import { describeBlock, parseScheduleBlock, removeScheduleBlock, reviewScheduleBlock, scheduleBlocks, showScheduleBlocks, type BlockAction } from '@/lib/schedule-blocks';
 import { comparableWhatsApp, hasWhatsAppWindow, parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText, shorten, WhatsAppError } from '@/lib/whatsapp';
@@ -200,7 +200,6 @@ async function beginInput(admin: string, action: Action, target = '', label = ''
   const instructions = action === 'hours' ? 'Responde a este mensaje con «13:00-17:00» o «Cerrado».'
     : action === 'block_dates' ? 'Responde con una fecha «AAAA-MM-DD» o un rango «AAAA-MM-DD a AAAA-MM-DD». Incluye el último día que tenga que quedar cerrado.'
     : action === 'block_hours' ? 'Responde con la fecha y las horas en formato «AAAA-MM-DD 13:00-15:00».'
-    : action === 'waitlist_day' ? 'Escribe la fecha que quieres revisar, por ejemplo «28/11/2026».'
     : action === 'faq_add' ? 'Responde con la pregunta y la respuesta separadas por |. Ejemplo: «¿Dónde están? | Estamos en Puebla».'
     : action === 'faq_question' || action === 'faq_answer' ? 'Responde a este mensaje con el texto nuevo.'
     : action === 'message' ? (target ? 'Responde a este mensaje con el texto que quieres enviar.'
@@ -233,7 +232,7 @@ async function reviewInput(admin: string, draft: Draft, content: string) {
     return true;
   }
   if (draft.action === 'waitlist_day') {
-    const date = parseWaitlistDate(content);
+    const date = parseClinicDateInput(content);
     if (date) await showWaitlistSlots(admin, draft.target, date);
     else await sendWhatsAppText(admin, 'Escribe una fecha vigente en formato DD/MM/AAAA, por ejemplo «28/11/2026».');
     return true;
@@ -371,7 +370,7 @@ export async function handleClinicAdministration(admin: string, option?: string,
     const draft = data as Draft | null;
     const direct = !context && draft && (draft.action === 'charge' || draft.action === 'payment' || draft.action === 'waitlist_day' ||
       (draft.action === 'message' && !draft.target && phoneInput));
-    if (draft?.prompt_id && (draft.prompt_id === context || direct)) return reviewInput(admin, draft, content);
+    if (data?.action !== 'task_create' && draft?.prompt_id && (draft.prompt_id === context || direct)) return reviewInput(admin, draft, content);
     if (!context && /^\s*\$?\d+(?:[.,]\d+)?\s+\p{L}/u.test(content)) {
       await sendWhatsAppText(admin, 'Para registrar un importe, abre la ficha del paciente y elige «Agregar deuda» o «Reducir deuda».');
       return true;
@@ -389,14 +388,12 @@ export async function handleClinicAdministration(admin: string, option?: string,
   const decision = option?.match(/^clinic_(save|back)_([a-f0-9-]{36})$/);
   const faqPage = option?.match(/^faq_admin_page_(\d{1,5})$/);
   const faq = option?.match(/^faq_admin_(view|question|answer|hide)_(\d{1,9})$/);
-  const waitlistDay = option?.match(/^admin_wait_day_([a-f0-9-]{36})$/);
   const waitlistSlot = option?.match(/^admin_wait_slot_([a-f0-9-]{36})_(\d{13})$/);
   if (option === 'admin_message_number' || messagePage || (!option && text === 'enviar mensaje a numero')) {
     await showPatientDirectory(admin, Number(messagePage?.[1] || 0), true);
   }
   else if (option === 'crm_message_manual') await beginInput(admin, 'message');
   else if (account) await showAccount(admin, account[1], Number(account[2]), true);
-  else if (waitlistDay) await beginInput(admin, 'waitlist_day', waitlistDay[1]);
   else if (waitlistSlot) {
     const start = new Date(Number(waitlistSlot[2])).toISOString();
     const id = randomUUID();
@@ -426,9 +423,6 @@ export async function handleClinicAdministration(admin: string, option?: string,
   else if (blockAction) await beginInput(admin, blockAction[1] as BlockAction);
   else if (blockDecision?.[1] === 'review') await reviewScheduleBlock(admin, blockDecision[2]);
   else if (blockDecision?.[1] === 'remove') await removeScheduleBlock(admin, blockDecision[2]);
-  else if (option === 'admin_tasks_menu') await showList(admin, '*Pendientes*', 'Ver opciones', [{ title: 'Pendientes', rows: [
-    { id: 'admin_task', title: 'Anotar pendiente' }, { id: 'admin_tasks_0', title: 'Ver pendientes' }, panels,
-  ] }]);
   else if (option === 'admin_crm' || directoryPage || (!option && ['pacientes', 'crm'].includes(text))) {
     await showPatientDirectory(admin, Number(directoryPage?.[1] || 0));
   }

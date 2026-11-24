@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { appointmentMatchesSlot, getAppointmentsByDateRange, getAvailableSlots, getCalendarAppointment, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
+import { appointmentMatchesSlot, getAppointmentsByDateRange, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
 import { withCalendarLock } from '@/lib/calendar-lock';
-import { clinicDate, clinicName, formatAppointment } from '@/lib/clinic-time';
+import { clinicDate, clinicInstant, clinicName, formatAppointment } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
 import { logWaitlistOffer, updateLoggedOffer, type WaitlistOfferStatus } from '@/lib/waitlist-offer-log';
 import { hasWhatsAppWindow, isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
@@ -240,16 +240,39 @@ async function deliverWaitlistOffer(opening: Opening, candidate: Entry, inWindow
   return 'sent';
 }
 
-export async function waitlistSlots(id: string, date: string) {
+async function currentWaitlistEntry(id: string) {
   const { data } = await requests().select('id,event_id,phone,original_start,original_end,patients!inner(last_inbound_at)')
     .eq('id', id).gt('original_start', now()).maybeSingle().throwOnError();
   if (!data) return null;
   const entry = data as unknown as Candidate;
   const event = await getCalendarAppointment(entry.event_id);
   if (!appointmentMatchesSlot(event, entry.phone, entrySlot(entry))) return null;
+  return entry;
+}
+
+export async function waitlistSlots(id: string, date: string) {
+  const entry = await currentWaitlistEntry(id);
+  if (!entry) return null;
   const duration = Date.parse(entry.original_end) - Date.parse(entry.original_start);
   const { slots } = await getAvailableSlots(date, duration);
   return { entry, slots: slots.filter(slot => Date.parse(slot.start) < Date.parse(entry.original_start) && Date.parse(slot.start) > Date.now()) };
+}
+
+export async function waitlistDates(id: string, fromDate: string) {
+  const entry = await currentWaitlistEntry(id);
+  if (!entry) return null;
+  const firstStart = clinicInstant(fromDate, '00:00').getTime();
+  const currentStart = Date.parse(entry.original_start);
+  const duration = Date.parse(entry.original_end) - currentStart;
+  const slots = firstStart < currentStart ? await getUpcomingSlots(firstStart - 1, duration, fromDate) : [];
+  const dates = new Map<string, number>();
+  for (const slot of slots) {
+    const start = Date.parse(slot.start);
+    if (start < firstStart || start >= currentStart || start <= Date.now()) continue;
+    const date = clinicDate(new Date(start));
+    dates.set(date, (dates.get(date) ?? 0) + 1);
+  }
+  return { dates: [...dates], originalDate: clinicDate(new Date(currentStart)) };
 }
 
 export async function offerWaitlistSlot(id: string, start: string) {

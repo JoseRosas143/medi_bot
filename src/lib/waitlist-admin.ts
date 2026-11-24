@@ -1,8 +1,9 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { CLINIC_TIMEZONE, clinicDate, clinicInstant } from '@/lib/clinic-time';
+import { upcomingSlotDays } from '@/lib/calendar';
+import { CLINIC_TIMEZONE, clinicDate, clinicInstant, nextDate, parseClinicDateInput as parseWaitlistDate } from '@/lib/clinic-time';
 import { showList } from '@/lib/menus';
 import { waitlistOfferHistory, type WaitlistOfferStatus } from '@/lib/waitlist-offer-log';
-import { waitlistSlots, withdrawWaitlistRequest } from '@/lib/waitlist';
+import { waitlistDates, waitlistSlots, withdrawWaitlistRequest } from '@/lib/waitlist';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppText, shorten, type WhatsAppListRow } from '@/lib/whatsapp';
 
 type Contact = { phone: string; patients: { full_name: string | null } | null };
@@ -17,6 +18,9 @@ const timestamp = new Intl.DateTimeFormat('es-MX', {
   hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
 });
 const when = (value: string) => timestamp.format(new Date(value));
+const dayLabel = new Intl.DateTimeFormat('es-MX', {
+  timeZone: CLINIC_TIMEZONE, weekday: 'short', day: 'numeric', month: 'short',
+});
 const name = (contact: Contact) => `${shorten(contact.patients?.full_name || 'Paciente', 60)} · •••• ${contact.phone.slice(-4)}`;
 const statusLabels: Record<WaitlistOfferStatus, string> = {
   sending: 'Envío en curso', sent: 'Enviada a WhatsApp', unknown: 'Envío sin confirmar', send_error: 'Envío rechazado',
@@ -118,12 +122,28 @@ async function confirmWithdrawal(phone: string, id: string) {
   });
 }
 
-export function parseWaitlistDate(input: string) {
-  const raw = input.trim();
-  const local = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  const date = local ? `${local[3]}-${local[2].padStart(2, '0')}-${local[1].padStart(2, '0')}` : raw;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < clinicDate()) return null;
-  try { clinicInstant(date, '12:00'); return date; } catch { return null; }
+async function showWaitlistDates(admin: string, id: string, fromDate = clinicDate(), page = 0) {
+  const available = await waitlistDates(id, fromDate);
+  if (!available) return sendWhatsAppText(admin, 'La solicitud o la cita cambió. Abre la lista de espera para actualizarla.');
+  const size = 7;
+  const rows = available.dates.slice(page * size, (page + 1) * size).map(([date, count]) => ({
+    id: `admin_wait_slots_${id}_${date}_0`,
+    title: dayLabel.format(clinicInstant(date, '12:00')),
+    description: `${count} ${count === 1 ? 'horario disponible' : 'horarios disponibles'}`,
+  }));
+  const nextPeriod = nextDate(fromDate, upcomingSlotDays);
+  const moreDays = available.dates.length > (page + 1) * size;
+  await showList(admin, `*Días disponibles*\n${rows.length ? 'Elige un día para ver sus horarios.'
+    : 'No encontré espacios para adelantar la cita en este periodo.'}`, 'Ver días', [
+    ...(rows.length ? [{ title: 'Fechas con horario libre', rows }] : []),
+    { title: 'Navegación', rows: [
+      ...(page ? [{ id: `admin_wait_dates_${id}_${fromDate}_${page - 1}`, title: 'Página anterior' }]
+        : fromDate !== clinicDate() ? [{ id: `admin_wait_day_${id}`, title: 'Primeras fechas' }] : []),
+      ...(moreDays ? [{ id: `admin_wait_dates_${id}_${fromDate}_${page + 1}`, title: 'Página siguiente' }]
+        : nextPeriod <= available.originalDate ? [{ id: `admin_wait_dates_${id}_${nextPeriod}_0`, title: 'Buscar más días' }] : []),
+      { id: `admin_wait_review_${id}`, title: 'Volver a la solicitud' },
+    ] },
+  ]);
 }
 
 export async function showWaitlistSlots(admin: string, id: string, date: string, page = 0) {
@@ -148,9 +168,16 @@ export async function handleAdminWaitlist(phone: string, option?: string, text =
   const page = option?.match(/^admin_wait_(queue|offers)_(\d{1,5})$/);
   const removal = option?.match(/^admin_wait_(review|withdraw|remove)_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/);
   const slots = option?.match(/^admin_wait_slots_([a-f0-9-]{36})_(\d{4}-\d{2}-\d{2})_(\d{1,4})$/);
+  const dates = option?.match(/^admin_wait_dates_([a-f0-9-]{36})_(\d{4}-\d{2}-\d{2})_(\d{1,4})$/);
+  const days = option?.match(/^admin_wait_day_([a-f0-9-]{36})$/);
   if (page) await showAdminWaitlist(phone, page[1] as Mode, Number(page[2]));
   else if (removal?.[1] === 'remove') await confirmWithdrawal(phone, removal[2]);
   else if (removal) await reviewRequest(phone, removal[2], removal[1] === 'withdraw');
+  else if (days) await showWaitlistDates(phone, days[1]);
+  else if (dates) {
+    const fromDate = parseWaitlistDate(dates[2]);
+    await showWaitlistDates(phone, dates[1], fromDate ?? undefined, fromDate ? Number(dates[3]) : 0);
+  }
   else if (slots && parseWaitlistDate(slots[2])) await showWaitlistSlots(phone, slots[1], slots[2], Number(slots[3]));
   else if (!option && text === 'lista de espera') await showAdminWaitlist(phone, 'queue', 0);
   else if (!option && text === 'historial de ofertas') await showAdminWaitlist(phone, 'offers', 0);

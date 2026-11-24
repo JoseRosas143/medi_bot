@@ -4,7 +4,8 @@ import { handleAppointmentAction, handleCancellationContactReply } from '@/lib/a
 import { handleAdminAppointments } from '@/lib/appointment-admin';
 import { handleBooking, startBooking } from '@/lib/booking';
 import { handlePatientAppointments, showPatientAppointments } from '@/lib/patient-appointments';
-import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
+import { completeClinicTask, handleTaskButtons, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
+import { handleTaskDraft } from '@/lib/task-draft';
 import { handleReceptionAction } from '@/lib/reception';
 import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
@@ -188,7 +189,6 @@ async function finishHumanChat(admin: string, patient: HumanPatient & { last_inb
 }
 
 const adminPrompts: Record<string, string> = {
-  admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
   adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',
 };
@@ -240,10 +240,12 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (optionId === 'adm_treatment_menu') return showAdminTreatmentMenu(from);
   if (optionId === 'adm_faq_menu') return showAdminFaqMenu(from);
   if (await handleAdminWaitlist(from, optionId, contextMessageId ? '' : text)) return;
+  if (await handleTaskDraft(from, optionId, content, contextMessageId)) return;
   if (await handleClinicAdministration(from, optionId, content, contextMessageId)) return;
-  const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
-  if (taskPage || (!optionId && /^(?:ver |lista de |mis )?pendientes$/.test(text))) {
-    return showPendingTasks(from, Number(taskPage?.[1] || 0));
+  if (await handleTaskButtons(from, optionId)) return;
+  const taskPage = optionId?.match(/^admin_tasks_(remove_)?(\d{1,6})$/);
+  if (optionId === 'admin_tasks_menu' || taskPage || (!optionId && /^(?:ver |lista de |mis |borrar )?pendientes$/.test(text))) {
+    return showPendingTasks(from, Number(taskPage?.[2] || 0), Boolean(taskPage?.[1]) || text === 'borrar pendientes');
   }
   if (!optionId) {
     const byPhone = content.trim().match(/^buscar citas? por whatsapp(?:\s+(.+))?$/i);
