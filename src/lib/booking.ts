@@ -6,6 +6,7 @@ import { withCalendarLock } from '@/lib/calendar-lock';
 import { appointmentMatchesSlot, findCalendarBooking, getAvailableSlots, getCalendarAppointment, getUpcomingSlots, moveCalendarAppointment, type CalendarEventData } from '@/lib/calendar';
 import { CLINIC_TIMEZONE, clinicDate, clinicInstant, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
+import { DEFAULT_APPOINTMENT_MINUTES, getSchedulableTreatment, matchSchedulableTreatment } from '@/lib/treatment-duration';
 import { offerReleasedAppointment } from '@/lib/waitlist';
 import { normalized, showList } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
@@ -19,6 +20,9 @@ type Details = {
   reason?: string;
   original?: CalendarEventData;
   awaitingDate?: boolean;
+  treatmentId?: number;
+  durationMinutes?: number;
+  reselectOnly?: boolean;
 };
 type Stage = 'search' | 'options' | 'name' | 'contact' | 'reason' | 'confirm' | 'processing' | 'confirmed';
 type Draft = { actor_phone: string; id: string; revision: string; stage: Stage; details: Details; expires_at: string };
@@ -104,13 +108,18 @@ function requestedSchedule(text: string, tentativeDate: string, requireDate = fa
 
 async function offer(draft: Draft, preference?: Preference | null, after?: number) {
   const phone = draft.actor_phone;
-  const next = await replaceDraft(draft, 'search', { ...draft.details, options: undefined, selected: undefined, awaitingDate: undefined });
+  const treatment = draft.details.treatmentId === undefined ? null : await getSchedulableTreatment(draft.details.treatmentId);
+  if (draft.details.treatmentId !== undefined && !treatment) {
+    return finishUnchanged(draft, 'Ese tratamiento ya no está disponible. Selecciona otro desde el menú.');
+  }
+  const next = await replaceDraft(draft, 'search', { ...draft.details,
+    durationMinutes: treatment?.duration_minutes, options: undefined, selected: undefined, awaitingDate: undefined });
   if (!next) return stale(phone);
   let slots: Slot[];
   let preferred: Slot | undefined;
   let label = '';
   const original = next.details.original;
-  const duration = original ? Date.parse(original.end) - Date.parse(original.start) : undefined;
+  const duration = original ? Date.parse(original.end) - Date.parse(original.start) : (next.details.durationMinutes ?? DEFAULT_APPOINTMENT_MINUTES) * 60_000;
   const otherSlots = (slots: Slot[]) => slots.filter(slot => !original || Date.parse(slot.start) !== Date.parse(original.start));
   if (preference) {
     const day = await getAvailableSlots(preference.date, duration);
@@ -146,11 +155,12 @@ async function offer(draft: Draft, preference?: Preference | null, after?: numbe
     'Puedes escribir «1», «2», «Proponer día» u «Otros horarios».');
 }
 
-export async function startBooking(phone: string, isAdmin: boolean, patientName?: string | null, treatment?: string, request?: string) {
+export async function startBooking(phone: string, isAdmin: boolean, patientName?: string | null, treatment?: string, request?: string, treatmentId?: number) {
   await openDraft(phone, {
     patientPhone: isAdmin ? undefined : phone,
     patientName: isAdmin ? undefined : fullName(patientName || '') || undefined,
     reason: treatment,
+    treatmentId,
   }, request);
 }
 
@@ -280,7 +290,7 @@ async function checkProcessing(draft: Draft) {
 }
 
 async function confirm(draft: Draft) {
-  const { selected, patientName, patientPhone, reason, original } = draft.details;
+  const { selected, patientName, patientPhone, reason, original, treatmentId, durationMinutes } = draft.details;
   if (!selected || !patientPhone) return stale(draft.actor_phone);
   if (!original && (!patientName || !reason)) return stale(draft.actor_phone);
   const lock = await replaceDraft(draft, 'processing', draft.details);
@@ -288,7 +298,8 @@ async function confirm(draft: Draft) {
   try {
     const result = original
       ? await withCalendarLock(lock.id, () => moveCalendarAppointment(original, draft.actor_phone, selected.start))
-      : await bookWithLock({ actionId: lock.id, patientName: patientName!, patientPhone, reason: reason!, startTime: selected.start });
+      : await bookWithLock({ actionId: lock.id, patientName: patientName!, patientPhone, reason: reason!, startTime: selected.start,
+        treatmentId, durationMinutes });
     if (result.state === 'confirmed') return markConfirmed(lock);
     if (result.state === 'changed') return finishUnchanged(lock, 'La cita cambió en la agenda. Abre «Mis citas» para ver el horario vigente.');
     if (result.state === 'busy') {
@@ -298,8 +309,8 @@ async function confirm(draft: Draft) {
     }
     await sendWhatsAppText(draft.actor_phone, original
       ? 'Ese horario se ocupó. Tu cita conserva el horario original. Te muestro otras opciones.'
-      : 'Ese horario se ocupó antes de confirmar. Te muestro otras opciones.');
-    await offer(lock);
+      : 'El horario o la duración cambió antes de confirmar. Te muestro otras opciones.');
+    await offer(original ? lock : { ...lock, details: { ...lock.details, reselectOnly: true } });
   } catch {
     // Keep the deterministic Calendar ID and reconcile before offering another reservation.
     await sendWhatsAppText(draft.actor_phone, 'La confirmación quedó pendiente de verificar. Espera dos minutos y vuelve a escribir para revisar el estado.');
@@ -357,9 +368,10 @@ export async function handleBooking(phone: string, option: string | undefined, c
     const slot = draft.details.options?.[index];
     if (!slot) await sendWhatsAppText(phone, 'Toca uno de los horarios disponibles o escribe «otros horarios».');
     else {
-      const moving = Boolean(draft.details.original);
-      const updated = await replaceDraft(draft, moving ? 'confirm' : 'name', { ...draft.details, selected: slot });
-      if (updated && moving) await showConfirmation(updated);
+      const ready = Boolean(draft.details.original || (draft.details.reselectOnly && draft.details.patientName &&
+        draft.details.patientPhone && draft.details.reason));
+      const updated = await replaceDraft(draft, ready ? 'confirm' : 'name', { ...draft.details, selected: slot });
+      if (updated && ready) await showConfirmation(updated);
       else if (updated) await askName(updated);
     }
   } else if (draft.stage === 'name') {
@@ -378,7 +390,16 @@ export async function handleBooking(phone: string, option: string | undefined, c
     const reason = content.trim().replace(/\s+/g, ' ');
     if (reason.length < 3 || reason.length > 300 || /^(?:si|confirmo|confirmar|listo)$/.test(action)) {
       await sendWhatsAppText(phone, 'Escribe el tratamiento o un motivo breve para la cita, de hasta 300 caracteres.');
-    } else await advance(draft, { ...draft.details, reason });
+    } else {
+      const treatment = await matchSchedulableTreatment(reason);
+      const details = { ...draft.details, reason, treatmentId: treatment?.id, durationMinutes: treatment?.duration_minutes };
+      const selected = draft.details.selected;
+      const duration = treatment?.duration_minutes ?? DEFAULT_APPOINTMENT_MINUTES;
+      if (selected && Date.parse(selected.end) - Date.parse(selected.start) !== duration * 60_000) {
+        await sendWhatsAppText(phone, `La cita necesita ${duration} minutos. Te muestro horarios para esa duración.`);
+        await offer({ ...draft, details: { ...details, reselectOnly: true } }, { date: clinicDate(new Date(selected.start)) });
+      } else await advance(draft, details);
+    }
   } else if (draft.stage === 'confirm') {
     if (button && action === 'confirm') await confirm(draft);
     else if (button && action === 'leave' && draft.details.original) await finishUnchanged(draft, 'Tu cita conserva el horario original.');
