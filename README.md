@@ -12,6 +12,10 @@ Bot de recepción para WhatsApp. Next.js recibe mensajes de Meta, Supabase guard
 
 En condiciones normales, el recordatorio se procesa unas 23–24 horas antes de la cita. La búsqueda se amplía a 21 horas y 55 minutos para tolerar una ejecución omitida y pequeños retrasos. Supabase registra el aviso por cita y hora de inicio para evitar duplicados en las ejecuciones solapadas.
 
+Después de reservar, el paciente puede aceptar o rechazar los recordatorios. También puede cambiar su preferencia desde «Recordatorios». Se envía el recordatorio de cita solo si el número asociado en Calendar tiene permiso guardado. Aplica la migración `reminder_consent_and_reception` antes de desplegar.
+
+Recepción recibe las solicitudes de lista de espera y puede ofrecer un horario desde la ficha de la solicitud. Para recibir estas alertas fuera de la ventana de WhatsApp, solicita la plantilla con `node --env-file=.env.local scripts/meta-templates.mjs --waitlist-reception --submit`. Una vez aprobada, guarda `solicitud_lista_espera_recepcion` en `bot_settings.admin_waitlist_template` o como `WHATSAPP_ADMIN_WAITLIST_TEMPLATE`. Mientras tanto, las alertas pendientes salen al abrir el panel con la ventana vigente o en la siguiente revisión automática.
+
 Los eventos creados por Benson guardan el teléfono de WhatsApp como propiedad privada `patientPhone`. Para enviar avisos sobre eventos creados manualmente, asocia esa misma propiedad al evento con el número validado. El bot omite eventos de día completo, cancelados o sin teléfono para los avisos.
 
 ## Plantillas de utilidad de Meta

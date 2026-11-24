@@ -50,7 +50,7 @@ async function sendChoices(phone: string, detail: string, buttons: { id: string;
 }
 
 async function showTreatment(phone: string, treatment: Treatment, saved = false) {
-  return sendChoices(phone, `${saved ? '✅ *Cambio guardado*\n\n' : ''}${formatTreatmentDetail(treatment)}\nDuración ${treatment.duration_minutes} min\n\n_${visibility(treatment.is_active)}_`, [
+  return sendChoices(phone, `${saved ? '✅ *Cambio guardado*\n\n' : ''}${formatTreatmentDetail(treatment)}\n\n_${visibility(treatment.is_active)}_`, [
     { id: `ted_fields_${treatment.id}`, title: 'Editar datos' },
     { id: `ted_is_active_${treatment.id}`, title: treatment.is_active ? 'Ocultar ficha' : 'Mostrar ficha' },
     { id: 'adm_edit_treatment', title: 'Ver tratamientos' },

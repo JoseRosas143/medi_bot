@@ -35,6 +35,7 @@ export async function showPatientMenu(to: string, returningName?: string) {
     { title: 'Tu cita', rows: [
       { id: 'agendar', title: 'Agendar cita', description: 'Consulta horarios y reserva' },
       { id: 'cancelar', title: 'Mis citas', description: 'Consulta o cancela una cita' },
+      { id: 'reminders_settings', title: 'Recordatorios', description: 'Cambia tu permiso de avisos por WhatsApp' },
       { id: 'my_debts', title: 'Mis deudas', description: 'Consulta tu saldo registrado' },
       { id: 'patient_name_edit', title: 'Corregir mi nombre' },
     ] },
@@ -116,10 +117,11 @@ export async function catalogDetail(catalog: Catalog, id: number): Promise<strin
     : `ℹ️ *${data.question}*\n${data.answer}`;
 }
 
-export type TreatmentCard = { name: string; price: number; description: string | null };
+export type TreatmentCard = { name: string; price: number; description: string | null; duration_minutes?: number | null };
 
 export function formatTreatmentDetail(treatment: TreatmentCard) {
-  return `🦷 *${treatment.name}*\n\n*En qué consiste*\n${treatment.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(treatment.price)}`;
+  const duration = Number.isInteger(treatment.duration_minutes) ? `\n\n*Duración estimada*\n${treatment.duration_minutes} minutos` : '';
+  return `🦷 *${treatment.name}*\n\n*En qué consiste*\n${treatment.description?.trim() || 'Recepción puede explicarte cómo se realiza este tratamiento.'}\n\n*Precio de catálogo*\n${formatPrice(treatment.price)}${duration}`;
 }
 
 export async function sendCatalogDetail(to: string, catalog: Catalog, id: number, detail: string) {
