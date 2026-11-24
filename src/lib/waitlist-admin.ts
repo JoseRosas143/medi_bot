@@ -1,8 +1,8 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
-import { CLINIC_TIMEZONE } from '@/lib/clinic-time';
+import { CLINIC_TIMEZONE, clinicDate, clinicInstant } from '@/lib/clinic-time';
 import { showList } from '@/lib/menus';
 import { waitlistOfferHistory, type WaitlistOfferStatus } from '@/lib/waitlist-offer-log';
-import { withdrawWaitlistRequest } from '@/lib/waitlist';
+import { waitlistSlots, withdrawWaitlistRequest } from '@/lib/waitlist';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppText, shorten, type WhatsAppListRow } from '@/lib/whatsapp';
 
 type Contact = { phone: string; patients: { full_name: string | null } | null };
@@ -82,16 +82,22 @@ async function showAdminWaitlist(phone: string, mode: Mode, page: number) {
     'Escribe «Lista de espera» o «Historial de ofertas» para abrir la primera página.');
 }
 
-async function reviewWithdrawal(phone: string, id: string) {
+async function reviewRequest(phone: string, id: string, withdrawing: boolean) {
   const { data } = await db.from('appointment_waitlist').select(requestColumns).eq('id', id)
     .gt('original_start', new Date().toISOString()).maybeSingle().throwOnError();
   if (!data) return sendWhatsAppText(phone, 'Esa solicitud ya no está activa. Actualiza la lista de espera.');
   const request = data as unknown as Request;
   return sendWhatsAppInteractiveButtons({
     to: phone,
-    bodyText: `*Retirar de la lista de espera*\n${name(request)}\nCita actual ${when(request.original_start)}\n\nSe conserva su cita. Si tiene una oferta vigente, el hueco pasa al siguiente paciente elegible.`,
-    buttons: [
+    bodyText: `*${withdrawing ? 'Retirar de la lista de espera' : 'Gestionar solicitud'}*\n${name(request)}\nCita actual ${when(request.original_start)}\n\n${withdrawing
+      ? 'Se conserva su cita. Si tiene una oferta vigente, el hueco pasa al siguiente paciente elegible.'
+      : 'Puedes elegir un día y ofrecer un horario. El paciente conserva su cita hasta que acepte.'}`,
+    buttons: withdrawing ? [
       { id: `admin_wait_remove_${request.id}`, title: 'Sí, retirar' },
+      { id: 'admin_wait_queue_0', title: 'Volver a la lista' },
+    ] : [
+      { id: `admin_wait_day_${request.id}`, title: 'Ofrecer horario' },
+      { id: `admin_wait_withdraw_${request.id}`, title: 'Retirar de la lista' },
       { id: 'admin_wait_queue_0', title: 'Volver a la lista' },
     ],
   });
@@ -112,12 +118,40 @@ async function confirmWithdrawal(phone: string, id: string) {
   });
 }
 
+export function parseWaitlistDate(input: string) {
+  const raw = input.trim();
+  const local = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const date = local ? `${local[3]}-${local[2].padStart(2, '0')}-${local[1].padStart(2, '0')}` : raw;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < clinicDate()) return null;
+  try { clinicInstant(date, '12:00'); return date; } catch { return null; }
+}
+
+export async function showWaitlistSlots(admin: string, id: string, date: string, page = 0) {
+  const available = await waitlistSlots(id, date);
+  if (!available) return sendWhatsAppText(admin, 'La solicitud o la cita cambió. Abre la lista de espera para actualizarla.');
+  const size = 7;
+  const rows = available.slots.slice(page * size, (page + 1) * size).map(slot => ({
+    id: `admin_wait_slot_${id}_${Date.parse(slot.start)}`, title: when(slot.start),
+  }));
+  await showList(admin, `*Ofrecer horario del ${date}*\n${rows.length ? 'Elige un espacio para revisar la oferta.'
+    : 'No hay espacios anteriores a la cita actual en esta página.'}`, 'Ver horarios', [
+      ...(rows.length ? [{ title: 'Horarios disponibles', rows }] : []),
+      { title: 'Navegación', rows: [
+        ...(page ? [{ id: `admin_wait_slots_${id}_${date}_${page - 1}`, title: 'Página anterior' }] : []),
+        ...(available.slots.length > (page + 1) * size ? [{ id: `admin_wait_slots_${id}_${date}_${page + 1}`, title: 'Página siguiente' }] : []),
+        { id: `admin_wait_day_${id}`, title: 'Elegir otro día' },
+      ] },
+    ]);
+}
+
 export async function handleAdminWaitlist(phone: string, option?: string, text = '') {
   const page = option?.match(/^admin_wait_(queue|offers)_(\d{1,5})$/);
-  const removal = option?.match(/^admin_wait_(review|remove)_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/);
+  const removal = option?.match(/^admin_wait_(review|withdraw|remove)_([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/);
+  const slots = option?.match(/^admin_wait_slots_([a-f0-9-]{36})_(\d{4}-\d{2}-\d{2})_(\d{1,4})$/);
   if (page) await showAdminWaitlist(phone, page[1] as Mode, Number(page[2]));
-  else if (removal?.[1] === 'review') await reviewWithdrawal(phone, removal[2]);
   else if (removal?.[1] === 'remove') await confirmWithdrawal(phone, removal[2]);
+  else if (removal) await reviewRequest(phone, removal[2], removal[1] === 'withdraw');
+  else if (slots && parseWaitlistDate(slots[2])) await showWaitlistSlots(phone, slots[1], slots[2], Number(slots[3]));
   else if (!option && text === 'lista de espera') await showAdminWaitlist(phone, 'queue', 0);
   else if (!option && text === 'historial de ofertas') await showAdminWaitlist(phone, 'offers', 0);
   else return false;

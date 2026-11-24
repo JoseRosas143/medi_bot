@@ -1,6 +1,7 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicDate, clinicName, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { handleAppointmentAction, handleCancellationContactReply } from '@/lib/appointment-actions';
+import { handleAdminAppointments } from '@/lib/appointment-admin';
 import { handleBooking, startBooking } from '@/lib/booking';
 import { handlePatientAppointments, showPatientAppointments } from '@/lib/patient-appointments';
 import { completeClinicTask, showClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
@@ -8,12 +9,13 @@ import { handleReceptionAction } from '@/lib/reception';
 import { runAdminAgent, showAppointmentsByWhatsApp, showSchedule } from '@/lib/handlers/adminHandler';
 import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { handleTreatmentEditor } from '@/lib/treatment-editor';
-import { handleWaitlistOffer } from '@/lib/waitlist';
+import { handleWaitlistOffer, notifyAdminWaitlist } from '@/lib/waitlist';
 import { handleAdminWaitlist } from '@/lib/waitlist-admin';
 import { handleClinicAdministration, showPatientBalance } from '@/lib/clinic-admin';
 import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showAdminTreatmentMenu, showCatalog, showPatientMenu } from '@/lib/menus';
 import { getSchedulableTreatment } from '@/lib/treatment-duration';
 import { handlePatientNameCorrection } from '@/lib/patient-name';
+import { handleReminderPreference } from '@/lib/reminder-preference';
 import { closeHumanChat, openHumanChat, trackHumanChatReply, recordChatMessage as history, type HumanPatient } from '@/lib/human-chat';
 import { hasWhatsAppWindow, isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
@@ -87,6 +89,7 @@ export async function handlePatientMessage(message: IncomingMessage) {
     return;
   }
 
+  if (await handleReminderPreference(from, content, optionId, inboundAt)) return;
   if (await handleWaitlistOffer(from, optionId)) return;
 
   if (patient.chat_mode === 'WAITING_HUMAN') {
@@ -124,7 +127,10 @@ export async function handlePatientMessage(message: IncomingMessage) {
 
   const fullName = patient.full_name?.trim();
   if (await handlePatientNameCorrection(from, optionId, content)) return;
-  if (optionId === 'my_debts' || (!optionId && /^(?:mis deudas|mi saldo)$/.test(text))) return showPatientBalance(from);
+  const balancePage = optionId?.match(/^my_debts_(\d{1,5})$/);
+  if (optionId === 'my_debts' || balancePage || (!optionId && /^(?:mis deudas|mi saldo)$/.test(text))) {
+    return showPatientBalance(from, Number(balancePage?.[1] || 0));
+  }
   const treatmentOption = optionId?.match(/^book_trt_(\d{1,9})$/);
   if (treatmentOption) {
     const treatment = await getSchedulableTreatment(Number(treatmentOption[1]));
@@ -182,12 +188,9 @@ async function finishHumanChat(admin: string, patient: HumanPatient & { last_inb
 }
 
 const adminPrompts: Record<string, string> = {
-  admin_cancelar: 'Dime la fecha y el nombre o la hora de la cita. Por ejemplo, «Corrige el WhatsApp de la cita de Ana de mañana a las 4 p. m.» o «Cancela la cita de hoy a las 5 p. m.».',
   admin_task: 'Escribe lo que hay que hacer. Si quieres un aviso, incluye el día y la hora. Por ejemplo, «Anota pedir guantes y recuérdamelo mañana a las 9:00».',
   admin_cerrar_chat: 'Responde al mensaje del paciente con «cerrar» para terminar su chat.',
   adm_add_treatment: 'Dime el nombre, el precio en MXN y una descripción breve del tratamiento.',
-  adm_add_faq: 'Escribe la pregunta y su respuesta en el mismo mensaje.',
-  adm_edit_faq: 'Escribe la pregunta y la nueva respuesta, o indica que quieres retirarla.',
 };
 
 export async function handleAdminMessage(message: IncomingMessage) {
@@ -231,6 +234,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
   }
   if (contextMessageId && !optionId && await handleCancellationContactReply(from, contextMessageId, content)) return;
   if (await handleAppointmentAction(from, optionId, true)) return;
+  if (await handleAdminAppointments(from, optionId, contextMessageId ? '' : text)) return;
   if (await handleTreatmentEditor(from, optionId, content, contextMessageId)) return;
   if (optionId === 'admin_panel') return showAdminMenu(from);
   if (optionId === 'adm_treatment_menu') return showAdminTreatmentMenu(from);
@@ -252,7 +256,10 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (optionId === 'admin_booking' || (!optionId && ['crear cita', 'agendar cita', 'reservar cita'].includes(text))) {
     return startBooking(from, true);
   }
-  if (!optionId && menuRequests.has(text)) return showAdminMenu(from);
+  if (!optionId && menuRequests.has(text)) {
+    await notifyAdminWaitlist().catch(() => console.error('Could not notify reception about the waitlist'));
+    return showAdminMenu(from);
+  }
   if (optionId === 'admin_agenda' || text === 'agenda de hoy') return showSchedule(from);
   if (optionId === 'rec_tomorrow' || (!optionId && text === 'agenda de manana')) return showSchedule(from, nextDate(clinicDate()));
   if (await handleReceptionAction(from, optionId)) return;
@@ -262,5 +269,6 @@ export async function handleAdminMessage(message: IncomingMessage) {
   }
   if (await handleBooking(from, optionId, content)) return;
   if (optionId) return;
+  if (contextMessageId) return void await sendWhatsAppText(from, 'Esa respuesta no corresponde a un formulario activo. Abre «Ayuda» y vuelve a elegir la opción.');
   await runAdminAgent(from, content);
 }

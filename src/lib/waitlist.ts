@@ -5,7 +5,7 @@ import { withCalendarLock } from '@/lib/calendar-lock';
 import { clinicDate, clinicName, formatAppointment } from '@/lib/clinic-time';
 import { formatVisitLocation } from '@/lib/clinic-visit';
 import { logWaitlistOffer, updateLoggedOffer, type WaitlistOfferStatus } from '@/lib/waitlist-offer-log';
-import { hasWhatsAppWindow, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
+import { hasWhatsAppWindow, isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 type Entry = { id: string; event_id: string; phone: string; original_start: string; original_end: string };
 type Candidate = Entry & { patients: { last_inbound_at: string | null } };
@@ -14,6 +14,7 @@ type Opening = {
   attempted_ids: string[]; candidate_id: string | null; candidate_event_id: string | null;
   candidate_phone: string | null; offer_id: string | null; deadline: string | null;
   checked_at: string;
+  manual?: boolean;
 };
 
 const requests = () => db.from('appointment_waitlist');
@@ -41,7 +42,7 @@ async function configuredTemplate() {
 
 async function reopen(opening: Opening, status: WaitlistOfferStatus = 'expired') {
   const next = await updateOpening(opening, {
-    state: available(opening) ? 'open' : 'closed',
+    state: !opening.manual && available(opening) ? 'open' : 'closed',
     candidate_id: null, candidate_event_id: null, candidate_phone: null, offer_id: null, deadline: null,
   });
   if (next && opening.offer_id) await updateLoggedOffer(opening.offer_id, status);
@@ -97,7 +98,7 @@ export async function changeWaitlistEnrollment(phone: string, event: CalendarEve
       if (!data) {
         const result = await requests().insert(row);
         if (result.error && result.error.code !== '23505') throw result.error;
-      } else await requests().update(row).eq('event_id', event.eventId).eq('id', data.id).throwOnError();
+      } else await requests().update({ ...row, admin_notified_at: null }).eq('event_id', event.eventId).eq('id', data.id).throwOnError();
     }
   } else {
     const { data } = await requests().select('id').eq('event_id', event.eventId)
@@ -113,6 +114,45 @@ export async function changeWaitlistEnrollment(phone: string, event: CalendarEve
   await sendWhatsAppText(phone, join
     ? '✅ Aparté tu lugar en la lista de espera. Tu cita sigue en el horario original.'
     : 'Saliste de la lista de espera. Tu cita sigue en el horario original.');
+  if (join) await notifyAdminWaitlist().catch(() => console.error('Could not notify reception about the waitlist'));
+}
+
+export async function notifyAdminWaitlist() {
+  const admin = phoneDigits(process.env.ADMIN_PHONE_NUMBER);
+  if (!isWhatsAppPhone(admin)) return;
+  const { data: settings } = await db.from('bot_settings').select('admin_last_inbound_at,admin_waitlist_template')
+    .eq('id', 1).maybeSingle().throwOnError();
+  const inWindow = hasWhatsAppWindow(settings?.admin_last_inbound_at);
+  const template = process.env.WHATSAPP_ADMIN_WAITLIST_TEMPLATE?.trim() || settings?.admin_waitlist_template?.trim();
+  if (!inWindow && !template) return;
+  const { data } = await requests().select('id,phone,original_start').is('admin_notified_at', null)
+    .gt('original_start', now()).order('requested_at').limit(3).throwOnError();
+  for (const entry of data ?? []) {
+    const claimedAt = now();
+    const { data: claimed } = await requests().update({ admin_notified_at: claimedAt }).eq('id', entry.id)
+      .is('admin_notified_at', null).select('id').maybeSingle().throwOnError();
+    if (!claimed) continue;
+    try {
+      const button = `admin_wait_review_${entry.id}`;
+      if (inWindow) {
+        try {
+          await sendWhatsAppInteractiveButtons({ to: admin,
+            bodyText: `*Nueva solicitud de lista de espera*\nPaciente •••• ${entry.phone.slice(-4)}\nCita actual: ${formatAppointment(entry.original_start)}`,
+            buttons: [{ id: button, title: 'Revisar solicitud' }] });
+          continue;
+        } catch (error) {
+          if (!(error instanceof WhatsAppError) || error.code !== 131047 || !template) throw error;
+        }
+      }
+      if (template) await sendWhatsAppTemplate(admin, template, [await clinicName(), formatAppointment(entry.original_start)], [button]);
+    } catch (error) {
+      if (error instanceof WhatsAppError && error.status < 500) {
+        await requests().update({ admin_notified_at: null }).eq('id', entry.id).eq('admin_notified_at', claimedAt).throwOnError();
+      }
+      console.error('Waitlist enrollment notice was not confirmed');
+      break;
+    }
+  }
 }
 
 async function sendOffer(opening: Opening, inWindow: boolean, approved?: string) {
@@ -175,22 +215,78 @@ async function dispatchOpening(opening: Opening) {
       if (next) await dispatchOpening(next);
       return;
     }
-    await logWaitlistOffer({
-      offer_id: claimed.offer_id!, request_id: candidate.id, phone: candidate.phone,
-      start_at: claimed.start_at, deadline: claimed.deadline,
-    });
-    try {
-      await sendOffer(claimed, inWindow, approved);
-      await updateLoggedOffer(claimed.offer_id!, 'sent', true);
-    } catch (error) {
-      // A definitive rejection releases the offer. An ambiguous response keeps it valid until its deadline.
-      if (error instanceof WhatsAppError && error.status === 400) await reopen(claimed, 'send_error');
-      else await updateLoggedOffer(claimed.offer_id!, 'unknown', true);
-      console.error('Waitlist offer not confirmed', { code: error instanceof WhatsAppError ? error.code : undefined });
-    }
+    await deliverWaitlistOffer(claimed, candidate, inWindow, approved);
     return;
   }
   await updateOpening(opening, { checked_at: now() });
+}
+
+async function deliverWaitlistOffer(opening: Opening, candidate: Entry, inWindow: boolean, approved?: string) {
+  await logWaitlistOffer({
+    offer_id: opening.offer_id!, request_id: candidate.id, phone: candidate.phone,
+    start_at: opening.start_at, deadline: opening.deadline,
+  });
+  try {
+    await sendOffer(opening, inWindow, approved);
+  } catch (error) {
+    if (error instanceof WhatsAppError && error.status === 400) {
+      await reopen(opening, 'send_error');
+      return 'rejected';
+    }
+    await updateLoggedOffer(opening.offer_id!, 'unknown', true);
+    return 'unknown';
+  }
+  await updateLoggedOffer(opening.offer_id!, 'sent', true);
+  return 'sent';
+}
+
+export async function waitlistSlots(id: string, date: string) {
+  const { data } = await requests().select('id,event_id,phone,original_start,original_end,patients!inner(last_inbound_at)')
+    .eq('id', id).gt('original_start', now()).maybeSingle().throwOnError();
+  if (!data) return null;
+  const entry = data as unknown as Candidate;
+  const event = await getCalendarAppointment(entry.event_id);
+  if (!appointmentMatchesSlot(event, entry.phone, entrySlot(entry))) return null;
+  const duration = Date.parse(entry.original_end) - Date.parse(entry.original_start);
+  const { slots } = await getAvailableSlots(date, duration);
+  return { entry, slots: slots.filter(slot => Date.parse(slot.start) < Date.parse(entry.original_start) && Date.parse(slot.start) > Date.now()) };
+}
+
+export async function offerWaitlistSlot(id: string, start: string) {
+  const approved = await configuredTemplate();
+  const result = await withCalendarLock(randomUUID(), async () => {
+    const available = await waitlistSlots(id, clinicDate(new Date(start)));
+    const slot = available?.slots.find(item => Date.parse(item.start) === Date.parse(start));
+    if (!slot || !available) return { state: 'unavailable' } as const;
+    const { entry } = available;
+    const inWindow = hasWhatsAppWindow(entry.patients.last_inbound_at);
+    if (!inWindow && !approved) return { state: 'closed_window' } as const;
+    const { data } = await openings().select('*').eq('start_at', slot.start).in('state', ['open', 'offered', 'processing'])
+      .maybeSingle().throwOnError();
+    const existing = data as Opening | null;
+    const deadline = Math.min(Date.now() + offerWindow, Date.parse(slot.start));
+    if (deadline <= Date.now()) return { state: 'unavailable' } as const;
+    const claim = { state: 'offered' as const, candidate_id: id, candidate_event_id: entry.event_id, candidate_phone: entry.phone,
+      offer_id: randomUUID(), deadline: expiry(deadline), attempted_ids: [...(existing?.attempted_ids ?? []), id] };
+    if (existing && (existing.state !== 'open' || existing.attempted_ids.includes(id) ||
+      Date.parse(existing.end_at) < Date.parse(slot.end))) return { state: 'already_offered' } as const;
+    let opening: Opening | null;
+    if (existing) opening = await updateOpening(existing, claim);
+    else {
+      const inserted = await openings().insert({ ...claim, manual: true, source_event_id: entry.event_id,
+        start_at: slot.start, end_at: slot.end }).select('*').maybeSingle();
+      if (inserted.error && inserted.error.code !== '23505') throw inserted.error;
+      opening = inserted.data as Opening | null;
+    }
+    if (!opening) return { state: 'already_offered' } as const;
+    return { state: 'ready', opening, entry, inWindow } as const;
+  });
+  if (result.state !== 'ready') return result.state;
+  if (!await getCandidate(result.opening)) {
+    await reopen(result.opening, 'withdrawn');
+    return 'unavailable';
+  }
+  return deliverWaitlistOffer(result.opening, result.entry, result.inWindow, approved);
 }
 
 async function queueOpening(event: CalendarEventData) {
@@ -221,7 +317,7 @@ async function completeMove(opening: Opening, entry: Entry) {
   await requests().delete().eq('event_id', entry.event_id).eq('id', entry.id).throwOnError();
   const released = await queueOpening({ eventId: entry.event_id, patientPhone: entry.phone, summary: '', ...entrySlot(entry) });
   try {
-    await sendWhatsAppText(entry.phone, `✅ *Cita adelantada*\n${formatAppointment(opening.start_at)}\n\n${await formatVisitLocation()}`);
+    await sendWhatsAppText(entry.phone, `✅ *Cita adelantada*\n${formatAppointment(opening.start_at)}\n\n${await formatVisitLocation()}\n\nEn el menú «Mis citas» puedes consultar tu cita, confirmar tu asistencia o cancelarla.`);
   } finally {
     if (released) await dispatchOpening(released);
   }
@@ -272,6 +368,7 @@ export async function handleWaitlistOffer(phone: string, option: string | undefi
 }
 
 export async function runWaitlist() {
+  await notifyAdminWaitlist().catch(() => console.error('Could not notify reception about the waitlist'));
   // Observe Calendar-only changes as well as openings reported immediately by WhatsApp.
   const capturedAt = now();
   await requests().delete().lte('original_start', capturedAt).throwOnError();

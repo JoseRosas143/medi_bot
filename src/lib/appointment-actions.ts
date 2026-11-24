@@ -4,6 +4,7 @@ import { withCalendarLock } from '@/lib/calendar-lock';
 import { formatAppointment } from '@/lib/clinic-time';
 import { hasVerifiedCancellationContact, isPatientNoticeDestination, sendAppointmentNotice } from '@/lib/appointment-notices';
 import { offerReleasedAppointment } from '@/lib/waitlist';
+import { startReschedule } from '@/lib/booking';
 import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, shorten } from '@/lib/whatsapp';
 
 type Cancellation = {
@@ -21,7 +22,7 @@ async function saveCancellation(phone: string, action: Cancellation) {
   return data!.id as string;
 }
 
-export async function proposeAppointmentAction(phone: string, action: Cancellation) {
+export async function proposeAppointmentAction(phone: string, action: Cancellation, manage = false) {
   const clinic = action.action === 'cancel_clinic';
   const canNotify = clinic && await hasVerifiedCancellationContact(action.details).catch(() => false);
   const id = await saveCancellation(phone, {
@@ -34,13 +35,14 @@ export async function proposeAppointmentAction(phone: string, action: Cancellati
   const title = clinic ? 'Administrar cita' : 'Confirmar cancelación';
   const bodyText = `*${title}*\n${actionLabel(action.details)}${contact}\n\nLas opciones vencen en 15 minutos.`;
   const options = [
+    ...(clinic && manage && action.details.patientPhone ? [{ id: `appointment_move_${id}`, title: 'Cambiar horario' }] : []),
     ...(canNotify ? [{ id: `appointment_notify_${id}`, title: 'Cancelar y avisar' }] : []),
     ...(clinic ? [{ id: `appointment_contact_${id}`, title: 'Corregir WhatsApp' }] : []),
     clinic ? { id: `appointment_only_${id}`, title: 'Solo cancelar' }
       : { id: `appointment_yes_${id}`, title: 'Sí, cancelar cita' },
-    { id: `appointment_no_${id}`, title: 'Volver' },
+    { id: manage ? 'admin_cancelar' : `appointment_no_${id}`, title: 'Volver' },
   ];
-  if (canNotify) {
+  if (options.length > 3) {
     await sendWhatsAppInteractiveList({
       to: phone, bodyText, buttonText: 'Ver opciones', sections: [{ title: 'Esta cita', rows: options }],
     });
@@ -99,7 +101,7 @@ export function bookWithLock(booking: Parameters<typeof createCalendarAppointmen
 }
 
 export async function handleAppointmentAction(phone: string, optionId: string | undefined, isAdmin: boolean) {
-  const match = optionId?.match(/^appointment_(yes|notify|only|contact|save|corrected|no)_([\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12})$/);
+  const match = optionId?.match(/^appointment_(yes|notify|only|contact|save|corrected|no|move)_([\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12})$/);
   if (!match) return false;
   const [, choice, id] = match;
   if (isAdmin ? choice === 'yes' : choice !== 'yes' && choice !== 'no') {
@@ -132,6 +134,10 @@ export async function handleAppointmentAction(phone: string, optionId: string | 
   }
   if (choice === 'contact') {
     await promptForCorrection(phone, action);
+    return true;
+  }
+  if (choice === 'move') {
+    await startReschedule(phone, action.details, undefined, true);
     return true;
   }
   if (choice === 'save' && correctedPhone) {

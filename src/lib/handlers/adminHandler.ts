@@ -64,10 +64,10 @@ const tools: ChatCompletionTool[] = [
     }, required: ['date'] },
   } },
   { type: 'function', function: {
-    name: 'manage_catalog', description: 'Lista, agrega, actualiza o retira un tratamiento o FAQ. Para editar o retirar, label es el nombre o pregunta existente.',
+    name: 'manage_catalog', description: 'Lista o agrega un tratamiento o FAQ. Para editar o retirar, envía al panel de catálogo.',
     parameters: { type: 'object', properties: {
-      catalog: { type: 'string', enum: ['treatments', 'faqs'] }, action: { type: 'string', enum: ['list', 'add', 'update', 'delete'] },
-      label: { type: 'string' }, new_label: { type: 'string' }, price: { type: 'number' }, answer: { type: 'string' },
+      catalog: { type: 'string', enum: ['treatments', 'faqs'] }, action: { type: 'string', enum: ['list', 'add'] },
+      label: { type: 'string' }, price: { type: 'number' }, answer: { type: 'string' },
       description: { type: 'string', description: 'Descripción del tratamiento para la ficha, proporcionada por la clínica.' },
     }, required: ['catalog', 'action'] },
   } },
@@ -94,47 +94,30 @@ const tools: ChatCompletionTool[] = [
   } },
 ];
 
-type CatalogRequest = { catalog: Catalog; action: string; label?: string; new_label?: string; price?: number; answer?: string; description?: string };
+type CatalogRequest = { catalog: Catalog; action: string; label?: string; price?: number; answer?: string; description?: string };
 
 async function manageCatalog(args: CatalogRequest) {
   const { catalog, action } = args;
   if (catalog !== 'treatments' && catalog !== 'faqs') return 'Elige un catálogo válido.';
   const treatments = catalog === 'treatments';
-  const field = treatments ? 'name' : 'question';
   if (action === 'list') {
     const { data } = await db.from(catalog).select('*').eq('is_active', true).order('id').limit(25).throwOnError();
     return data ?? [];
   }
+  if (action !== 'add') return 'Para editar o retirar, abre el catálogo correspondiente en «Ayuda» y selecciona el registro.';
   const label = args.label?.trim();
   if (!label || label.length > 250) return 'Especifica el nombre o la pregunta.';
   const priceValid = typeof args.price === 'number' && Number.isFinite(args.price) && args.price >= 0;
   const answer = args.answer?.trim();
   const description = args.description?.trim();
   if (treatments && description && description.length > 600) return 'Escribe una descripción de hasta 600 caracteres.';
-  const newLabel = args.new_label?.trim();
-  if (action === 'add') {
-    if (treatments && !priceValid) return 'Indica un precio válido en MXN.';
-    if (!treatments && !answer) return 'Indica la respuesta de la pregunta.';
-    const values: Record<string, unknown> = treatments ? { name: label, price: args.price, description: description || null } : { question: label, answer };
-    const existing = await findCatalogEntries(catalog, label);
-    if (existing.some(item => normalized(item.label) === normalized(label))) return 'Ya existe una opción activa con ese nombre.';
-    await db.from(catalog).insert(values).throwOnError();
-    return 'Opción guardada.';
-  }
-  if (action !== 'update' && action !== 'delete') return 'Acción desconocida.';
-  const entries = await findCatalogEntries(catalog, label);
-  if (entries.length !== 1) return { mensaje: 'Identifica una sola opción.', coincidencias: entries.map(item => item.label) };
-  const changes: Record<string, unknown> = {};
-  if (action === 'delete') changes.is_active = false;
-  else {
-    if (newLabel && newLabel.length <= 250) changes[field] = newLabel;
-    if (treatments && priceValid) changes.price = args.price;
-    if (treatments && description) changes.description = description;
-    if (!treatments && answer) changes.answer = answer;
-  }
-  if (!Object.keys(changes).length) return 'Faltan datos válidos para el cambio.';
-  const { data } = await db.from(catalog).update(changes).eq('id', entries[0].id).eq('is_active', true).select('id').maybeSingle().throwOnError();
-  return data ? (action === 'delete' ? 'Opción retirada del catálogo.' : 'Opción actualizada.') : 'La opción ya no está activa.';
+  if (treatments && !priceValid) return 'Indica un precio válido en MXN.';
+  if (!treatments && !answer) return 'Indica la respuesta de la pregunta.';
+  const values: Record<string, unknown> = treatments ? { name: label, price: args.price, description: description || null } : { question: label, answer };
+  const existing = await findCatalogEntries(catalog, label);
+  if (existing.some(item => normalized(item.label) === normalized(label))) return 'Ya existe una opción activa con ese nombre.';
+  await db.from(catalog).insert(values).throwOnError();
+  return 'Opción guardada.';
 }
 
 export async function runAdminAgent(from: string, content: string) {

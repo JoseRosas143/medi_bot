@@ -21,6 +21,11 @@ export async function hasVerifiedCancellationContact(appointment: CalendarEventD
 
 export async function sendAppointmentNotice(appointment: CalendarEventData, kind: 'reminder' | 'cancellation', adminConfirmedPhone?: string) {
   if (!appointment.patientPhone) return 'no_contact';
+  if (kind === 'reminder') {
+    const { data } = await db.from('patients').select('reminder_whatsapp_allowed')
+      .eq('phone', appointment.patientPhone).maybeSingle().throwOnError();
+    if (data?.reminder_whatsapp_allowed !== true) return 'no_consent';
+  }
   if (kind === 'cancellation') {
     const verified = adminConfirmedPhone === undefined
       ? await hasVerifiedCancellationContact(appointment)

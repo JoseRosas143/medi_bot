@@ -9,6 +9,7 @@ import { formatVisitLocation } from '@/lib/clinic-visit';
 import { DEFAULT_APPOINTMENT_MINUTES, getSchedulableTreatment, matchSchedulableTreatment } from '@/lib/treatment-duration';
 import { offerReleasedAppointment } from '@/lib/waitlist';
 import { normalized, showList } from '@/lib/menus';
+import { askReminderPreference } from '@/lib/reminder-preference';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
 
 type Slot = Awaited<ReturnType<typeof getUpcomingSlots>>[number];
@@ -164,13 +165,13 @@ export async function startBooking(phone: string, isAdmin: boolean, patientName?
   }, request);
 }
 
-export async function startReschedule(phone: string, original: CalendarEventData, request?: string) {
+export async function startReschedule(phone: string, original: CalendarEventData, request?: string, isAdmin = false) {
   const duration = Date.parse(original.end) - Date.parse(original.start);
-  if (original.patientPhone !== phone || !Number.isFinite(duration) || duration <= 0) {
+  if (!original.patientPhone || (!isAdmin && original.patientPhone !== phone) || !Number.isFinite(duration) || duration <= 0) {
     await sendWhatsAppText(phone, 'Consulta con recepción para cambiar esta cita.');
     return;
   }
-  await openDraft(phone, { patientPhone: phone, original }, request);
+  await openDraft(phone, { patientPhone: original.patientPhone, original }, request);
 }
 
 async function openDraft(phone: string, details: Details, request?: string) {
@@ -261,10 +262,11 @@ async function markConfirmed(draft: Draft) {
   }
   const moved = Boolean(original);
   const status = moved ? 'Cita reagendada' : 'Cita confirmada';
-  const attendance = moved ? '\nPuedes confirmar tu asistencia al nuevo horario en «Mis citas».' : '';
-  const location = draft.details.patientPhone === draft.actor_phone ? `\n\n${await formatVisitLocation()}` : '';
+  const selfBooking = patientPhone === draft.actor_phone;
+  const location = selfBooking ? `\n\n${await formatVisitLocation()}\n\nEn el menú «Mis citas» puedes consultar tu cita, confirmar tu asistencia o cancelarla.` : '';
   try {
-    await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(selected)}${attendance}${location}`);
+    await sendWhatsAppText(draft.actor_phone, `✅ *${status}*\n${formatSlot(selected)}${location}`);
+    if (selfBooking && !moved) await askReminderPreference(draft.actor_phone);
   } finally {
     if (alertAdmin) await dispatchAdminBookingNotice(bookingId, selected.start).catch(() => console.error('Could not dispatch booking notice'));
     if (original) await offerReleasedAppointment(original).catch(() => console.error('Could not process released appointment'));
@@ -285,7 +287,7 @@ async function checkProcessing(draft: Draft) {
   if (appointmentMatchesSlot(event, draft.details.patientPhone, draft.details.selected)) {
     return markConfirmed(draft);
   }
-  if (original && (!event || event.patientPhone !== phone || Date.parse(event.start) !== Date.parse(original.start))) {
+  if (original && (!event || event.patientPhone !== draft.details.patientPhone || Date.parse(event.start) !== Date.parse(original.start))) {
     return finishUnchanged(draft, 'La cita cambió en la agenda. Consulta su estado en «Mis citas».');
   }
   if (!original && event) return sendWhatsAppText(phone, 'Revisa «Mis citas» o consulta con recepción antes de reservar otra.');
@@ -301,7 +303,7 @@ async function confirm(draft: Draft) {
   if (!lock) return stale(draft.actor_phone);
   try {
     const result = original
-      ? await withCalendarLock(lock.id, () => moveCalendarAppointment(original, draft.actor_phone, selected.start))
+      ? await withCalendarLock(lock.id, () => moveCalendarAppointment(original, patientPhone, selected.start))
       : await bookWithLock({ actionId: lock.id, patientName: patientName!, patientPhone, reason: reason!, startTime: selected.start,
         treatmentId, durationMinutes });
     if (result.state === 'confirmed') return markConfirmed(lock);

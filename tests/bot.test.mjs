@@ -51,6 +51,8 @@ let taskReminderTemplate = null;
 const config = {};
 const balances = new Map();
 const ledgerIds = new Set();
+const accountEntries = [];
+const reminderPreferences = new Map();
 const clinicDrafts = new Map();
 const scheduleBlocks = new Map();
 const defaultHours = () => Array.from({ length: 7 }, (_, weekday) => ({ weekday, opens_at: '09:00', closes_at: '19:00' }));
@@ -139,6 +141,7 @@ const treatments = Array.from({ length: 12 }, (_, i) => ({
   id: i + 1, price: 100.5 + i, name: `Tratamiento de muestra número ${i + 1}`,
   description: 'Descripción informativa de la clínica.', is_active: true, duration_minutes: 45,
 }));
+const faqs = [{ id: 1, question: '¿Dónde está la clínica?', answer: 'En Puebla.', is_active: true }];
 
 function query(table) {
   let operation = 'select';
@@ -238,7 +241,7 @@ function query(table) {
               [...storage.values()].some(row => row.start_at === values.start_at && row.state !== 'closed')) {
             return resolve({ data: null, error: { code: '23505' } });
           }
-          const row = isEntry ? { ...values } : {
+          const row = isEntry ? { admin_notified_at: null, ...values } : {
             id: randomUUID(), revision: randomUUID(), state: 'open', attempted_ids: [], deadline: null, checked_at: '', ...values,
           };
           storage.set(isEntry ? values.event_id : row.id, row);
@@ -383,11 +386,16 @@ function query(table) {
         const row = {
           phone: filters.phone, full_name: patientNames.get(filters.phone) ?? 'Ana Demo',
           last_inbound_at: lastInbounds.get(filters.phone),
+          reminder_whatsapp_allowed: reminderPreferences.has(filters.phone) ? reminderPreferences.get(filters.phone) : true,
           chat_mode: session ? 'WAITING_HUMAN' : 'AI_ACTIVE', human_session_id: session,
         };
         return resolve({ data: Object.entries(filters).every(([key, value]) => row[key] === value) ? row : null });
       }
       if (table === 'patients' && operation === 'upsert') directoryContacts.add(values.phone);
+      if (table === 'patients' && operation === 'update' && Object.hasOwn(values, 'reminder_whatsapp_allowed')) {
+        reminderPreferences.set(filters.phone, values.reminder_whatsapp_allowed);
+        return resolve({ data: { phone: filters.phone }, error: null });
+      }
       if (table === 'patients' && operation === 'update' && values.chat_mode) {
         const current = humanSessions.get(filters.phone);
         if (filters.chat_mode === 'AI_ACTIVE' ? current : current !== filters.human_session_id) return resolve({ data: null });
@@ -404,8 +412,14 @@ function query(table) {
         return resolve({ data: { phone: filters.phone }, error: null });
       }
       if (table === 'chat_messages' && operation === 'insert') saved.push(values);
-      if (table === 'treatments') {
-        let rows = treatments.filter(row =>
+      if (table === 'treatments' || table === 'faqs') {
+        const catalog = table === 'treatments' ? treatments : faqs;
+        if (operation === 'insert') {
+          const row = { id: catalog.length + 1, is_active: true, ...values };
+          catalog.push(row);
+          return resolve({ data: row, error: null });
+        }
+        let rows = catalog.filter(row =>
           Object.entries(filters).every(([key, value]) => row[key] === value) && constraints.every(check => check(row)));
         if (operation === 'update') rows.forEach(row => Object.assign(row, values));
         if (range) rows = rows.slice(range[0], range[1] + 1);
@@ -426,12 +440,15 @@ function query(table) {
 const readField = (row, field) => field.split('.').reduce((value, part) => value?.[part], row);
 globalThis.testDatabase = { from: query, rpc: (name, args) => ({ throwOnError: async () => {
   if (name === 'patient_account_balance') return { data: balances.get(args.p_phone) || 0 };
+  if (name === 'patient_account_statement') return { data: { balance_cents: balances.get(args.p_phone) || 0,
+    entries: accountEntries.filter(entry => entry.phone === args.p_phone).reverse().slice(args.p_offset, args.p_offset + 6) } };
   if (name === 'record_patient_account_entry') {
     if (ledgerIds.has(args.p_id)) return { data: 'duplicate' };
     const total = (balances.get(args.p_phone) || 0) + args.p_delta;
     if (total < 0) return { data: 'insufficient' };
     ledgerIds.add(args.p_id);
     balances.set(args.p_phone, total);
+    accountEntries.push({ phone: args.p_phone, delta_cents: args.p_delta, note: args.p_note });
     return { data: 'saved' };
   }
   return { error: null };
@@ -490,6 +507,7 @@ test('processes all messages in a batch and routes by option ID on redelivery', 
   assert.match(detail.interactive.body.text, /Tratamiento de muestra número 3/);
   assert.match(detail.interactive.body.text, /102\.50/);
   assert.match(detail.interactive.body.text, /Descripción informativa/);
+  assert.match(detail.interactive.body.text, /Duración estimada\*\n45 minutos/);
   assert.equal(detail.interactive.action.buttons[0].reply.id, 'book_trt_3');
   assert.match(saved.at(-1).content, /102\.50/);
 });
@@ -685,6 +703,8 @@ test('reception opens a two-way chat by number and closes only that session', as
   adminLastInbound = new Date().toISOString();
   try {
     await webhook([answerButton('chat-number-open', 'admin_message_number', admin)]);
+    assert.ok(lastButtons().includes(`crm_message_${phone}`));
+    await webhook([answerButton('chat-number-manual', 'crm_message_manual', admin)]);
     assert.match(metaRequests.at(-1).text.body, /Escribe el WhatsApp/);
     await webhook([textMessage('chat-number-entered', '55 4455 6677', admin)]);
     assert.match(metaRequests.at(-1).text.body, /María Demo.*6677/);
@@ -767,14 +787,20 @@ test('admin CRM searches, sends a confirmed message and adjusts a balance withou
     await confirmAdminInput(`crm_message_${patient}`, 'Este mensaje debe esperar.', 'crm-message-closed');
     assert.match(metaRequests.at(-1).text.body, /La ventana de WhatsApp está cerrada/);
     assert.ok(!metaRequests.some(entry => entry.to === patient && entry.text?.body === 'Este mensaje debe esperar.'));
-    const charge = await confirmAdminInput(`crm_charge_${patient}`, '500 Consulta', 'crm-charge');
+    const charge = await confirmAdminInput(`crm_charge_${patient}`, '500 Resina', 'crm-charge');
     await webhook([answerButton('replay-crm-charge-button', charge, admin)]);
     assert.equal(balances.get(patient), 50_000);
-    await confirmAdminInput(`crm_payment_${patient}`, '700 Abono', 'overpayment');
+    await confirmAdminInput(`crm_charge_${patient}`, '1000 Cirugía', 'crm-second-charge');
+    await confirmAdminInput(`crm_payment_${patient}`, '1600 Abono', 'overpayment');
     assert.match(metaRequests.at(-1).text.body, /supera el saldo/);
-    await confirmAdminInput(`crm_payment_${patient}`, '200 Abono', 'crm-payment');
+    const price = treatments[0].price;
+    await webhook([answerButton('unquoted-payment-open', `crm_payment_${patient}`, admin)]);
+    await webhook([textMessage('unquoted-payment-amount', '800 Depósito', admin)]);
+    await webhook([answerButton('unquoted-payment-confirm', lastButtons()[0], admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Resina[\s\S]*Cirugía[\s\S]*Depósito[\s\S]*700\.00/);
+    assert.equal(treatments[0].price, price);
     await webhook([answerButton('patient-balance-test', 'my_debts', patient), answerButton('other-balance-test', 'my_debts', other)]);
-    assert.match(metaRequests.at(-2).interactive.body.text, /300\.00/);
+    assert.match(metaRequests.at(-2).interactive.body.text, /700\.00/);
     assert.match(metaRequests.at(-1).interactive.body.text, /\b0\.00$/);
   } finally {
     balances.clear();
@@ -801,7 +827,7 @@ async function joinWaitlist(phone, tag) {
   await webhook([textMessage(`wait-menu-${tag}`, 'Lista de espera', phone)]);
   await webhook([answerButton(`wait-detail-${tag}`, lastButtons().find(id => id.startsWith('appt_wait_')), phone)]);
   await webhook([answerButton(`wait-enroll-${tag}`, lastButtons().find(id => id.startsWith('appt_wait_join_')), phone)]);
-  assert.match(metaRequests.at(-1).text.body, /lista de espera/);
+  assert.match(metaRequests.findLast(message => message.to === phone).text.body, /lista de espera/);
 }
 
 test('waitlist offers a cancelled slot in FIFO order and moves only the patient who accepts', async () => {
@@ -892,6 +918,7 @@ test('admin can withdraw a waitlist request and reoffer its slot without changin
     const entry = waitEntries.get(firstEvent.id);
     await webhook([answerButton('admin-review-withdrawal', `admin_wait_review_${entry.id}`, admin)]);
     assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo/);
+    await webhook([answerButton('admin-review-remove', `admin_wait_withdraw_${entry.id}`, admin)]);
     const confirmation = lastButtons()[0];
     await webhook([answerButton('patient-cannot-withdraw-admin-request', confirmation, second)]);
     assert.ok(waitEntries.has(firstEvent.id));
@@ -921,6 +948,80 @@ test('admin can withdraw a waitlist request and reoffer its slot without changin
     waitOpenings.clear();
     waitOffers.clear();
     events.clear();
+  }
+});
+
+test('reception is notified once and can pick a date and offer an earlier slot to the waiting patient', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const event = seedWaitlistAppointment('wait-manual-entry', patient, '18');
+  adminLastInbound = new Date().toISOString();
+  try {
+    const before = metaRequests.length;
+    await joinWaitlist(patient, 'manual-offer');
+    const request = waitEntries.get(event.id);
+    const notice = metaRequests.slice(before).find(message => message.to === admin);
+    assert.match(notice.interactive.body.text, /Nueva solicitud de lista de espera/);
+    assert.equal(notice.interactive.action.buttons[0].reply.id, `admin_wait_review_${request.id}`);
+    await webhook([answerButton('wait-manual-review', `admin_wait_review_${request.id}`, admin)]);
+    await webhook([answerButton('wait-manual-day', `admin_wait_day_${request.id}`, admin)]);
+    await webhook([textMessage('wait-manual-date', '20/11/2099', admin)]);
+    const slot = lastButtons().find(id => id.startsWith('admin_wait_slot_'));
+    assert.ok(slot);
+    await webhook([answerButton('wait-manual-slot', slot, admin)]);
+    await webhook([answerButton('wait-manual-send', lastButtons()[0], admin)]);
+    assert.match(metaRequests.at(-1).text.body, /aceptó la oferta/);
+    const offer = metaRequests.findLast(message => message.to === patient && message.interactive?.body.text.includes('Se liberó un horario'));
+    assert.equal(events.get(event.id).start.dateTime, event.start.dateTime);
+    await webhook([answerButton('wait-manual-accept', offer.interactive.action.buttons[0].reply.id, patient)]);
+    assert.equal(Date.parse(events.get(event.id).start.dateTime), Date.parse(calendarSlots[0].start));
+    assert.equal(metaRequests.slice(before).filter(message => message.to === admin && message.interactive?.body.text.includes('Nueva solicitud')).length, 1);
+  } finally {
+    adminLastInbound = null;
+    clinicDrafts.clear();
+    waitEntries.clear();
+    waitOpenings.clear();
+    waitOffers.clear();
+    events.clear();
+  }
+});
+
+test('admin selects a FAQ, edits the answer and explicitly retires it', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const original = { ...faqs[0] };
+  try {
+    await webhook([answerButton('faq-admin-edit-list', 'adm_edit_faq', admin)]);
+    assert.ok(lastButtons().includes('faq_admin_view_1'));
+    await webhook([answerButton('faq-admin-view', 'faq_admin_view_1', admin)]);
+    assert.ok(lastButtons().includes('faq_admin_answer_1'));
+    await confirmAdminInput('faq_admin_answer_1', 'En Puebla, con cita previa.', 'faq-apply');
+    assert.equal(faqs[0].answer, 'En Puebla, con cita previa.');
+    await webhook([answerButton('faq-admin-hide-review', 'faq_admin_hide_1', admin)]);
+    assert.equal(faqs[0].is_active, true);
+    await webhook([answerButton('faq-admin-hide-save', lastButtons()[0], admin)]);
+    assert.equal(faqs[0].is_active, false);
+    await webhook([answerButton('faq-admin-edit-refresh', 'adm_edit_faq', admin)]);
+    assert.ok(!lastButtons().includes('faq_admin_view_1'));
+  } finally {
+    faqs[0] = original;
+    clinicDrafts.clear();
+  }
+});
+
+test('admin chooses a future appointment and sees its change options', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  const event = seedWaitlistAppointment('admin-appointment-menu', patient, '18');
+  event.start.dateTime = new Date(Date.now() + 86_400_000).toISOString();
+  event.end.dateTime = new Date(Date.parse(event.start.dateTime) + 2_700_000).toISOString();
+  try {
+    await webhook([answerButton('admin-appt-menu', 'admin_cancelar', admin)]);
+    const selection = lastButtons().find(id => id.startsWith('admin_appt_view_'));
+    assert.ok(selection);
+    await webhook([answerButton('admin-appt-select', selection, admin)]);
+    assert.ok(lastButtons().some(id => id.startsWith('appointment_contact_')));
+    assert.ok(lastButtons().some(id => id.startsWith('appointment_move_')));
+    assert.ok(lastButtons().some(id => id.startsWith('appointment_only_')));
+  } finally {
+    events.delete(event.id);
   }
 });
 
@@ -1430,6 +1531,14 @@ test('a time change invalidates the previous confirmation and creates only the s
   assert.equal(createdAppointments[0].reason, treatments[2].name);
   const confirmed = metaRequests.slice(before).find(message => message.text?.body.includes('*Cita confirmada*'));
   assert.ok(confirmed.text.body.includes('https://maps.app.goo.gl/15xyVp2bi89p6Lrs5?g_st=ac'));
+  assert.match(confirmed.text.body, /Mis citas.*confirmar tu asistencia o cancelarla/);
+  const consent = metaRequests.slice(before).find(message => message.interactive?.action.buttons?.some(button => button.reply.id === 'reminders_accept'));
+  assert.ok(consent);
+  await webhook([answerButton('save-demo-reminders-accept', 'reminders_accept')]);
+  assert.equal(reminderPreferences.get(patient), true);
+  await webhook([answerButton('save-demo-reminders-decline', 'reminders_decline')]);
+  assert.equal(reminderPreferences.get(patient), false);
+  reminderPreferences.delete(patient);
 });
 
 test('the admin books for the patient and confirms name, contact, and reason', async () => {
@@ -1493,18 +1602,28 @@ test('an authenticated cron run sends an appointment template and never the welc
   process.env.CRON_SECRET = 'real-demo-secret';
   process.env.WHATSAPP_REMINDER_TEMPLATE = 'cita_recordatorio';
   const start = new Date(Date.now() + 23 * 60 * 60 * 1000).toISOString();
-  upcomingAppointments = [{ eventId: 'cron-test', summary: 'Cita: Ana Demo', start, patientPhone: patient }];
+  const declined = '525500008881';
+  const unanswered = '525500008882';
+  reminderPreferences.set(declined, false);
+  reminderPreferences.set(unanswered, null);
+  upcomingAppointments = [
+    { eventId: 'cron-test', summary: 'Cita: Ana Demo', start, patientPhone: patient },
+    { eventId: 'cron-test-declined', summary: 'Cita: Demo No', start, patientPhone: declined },
+    { eventId: 'cron-test-unanswered', summary: 'Cita: Demo Sin Respuesta', start, patientPhone: unanswered },
+  ];
   const count = metaRequests.length;
   try {
     const request = new Request('https://clinic.test/api/cron/reminders', { headers: { authorization: 'Bearer real-demo-secret' } });
     const result = await reminders(request);
     assert.equal(result.status, 200);
-    assert.deepEqual((await result.json()).counts, { accepted: 1 });
+    assert.deepEqual((await result.json()).counts, { accepted: 1, no_consent: 2 });
     assert.equal(metaRequests.length, count + 1);
     assert.equal(metaRequests.at(-1).template.name, 'cita_recordatorio');
     assert.equal(metaRequests.at(-1).type, 'template');
   } finally {
     upcomingAppointments = [];
+    reminderPreferences.delete(declined);
+    reminderPreferences.delete(unanswered);
   }
 });
 

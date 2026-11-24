@@ -4,7 +4,14 @@ if (!WHATSAPP_TOKEN || !/^\d+$/.test(WHATSAPP_WABA_ID || '')) {
   process.exit(1);
 }
 
-const templates = process.argv.includes('--booking-alerts') ? [
+const templates = process.argv.includes('--waitlist-reception') ? [
+  {
+    name: 'solicitud_lista_espera_recepcion',
+    text: 'Hay una nueva solicitud de lista de espera en {{1}} para adelantar la cita del {{2}}. Revisa la solicitud en el panel de recepción.',
+    examples: ['J R Dental', 'lunes, 30 de noviembre de 2026, 16:00'],
+    buttons: ['Revisar solicitud'],
+  },
+] : process.argv.includes('--booking-alerts') ? [
   {
     name: 'cita_adelanto_lista_espera',
     text: 'Se liberó un horario en {{1}} el {{2}}. Responde antes de que pasen 30 minutos o comience la cita. Conservas tu horario actual hasta que se confirme el cambio.',
