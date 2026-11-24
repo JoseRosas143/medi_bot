@@ -60,20 +60,18 @@ async function closeHumanChat(patient: HumanPatient) {
 async function notifyDoctor(patient: HumanPatient, content: string) {
   const admin = phoneDigits(process.env.ADMIN_PHONE_NUMBER);
   if (!isWhatsAppPhone(admin)) return false;
-  const template = process.env.WHATSAPP_HANDOFF_TEMPLATE;
+  const template = process.env.WHATSAPP_HANDOFF_TEMPLATE?.trim() || 'solicitud_atencion_recepcion';
   const { data: settings } = await db.from('bot_settings').select('admin_last_inbound_at').eq('id', 1).single().throwOnError();
   const lastInbound = settings?.admin_last_inbound_at;
   const outsideWindow = !lastInbound || Date.now() - Date.parse(lastInbound) >= 86_400_000;
   let id: string;
   if (outsideWindow) {
-    if (!template) return false;
     id = await sendWhatsAppTemplate(admin, template, [await clinicName()]);
   } else {
     try {
       id = await sendWhatsAppText(admin, `🩺 *Atención por WhatsApp*\n${patient.full_name || 'Paciente'}\n\n${content}\n\nDesliza este mensaje para responder o escribe «cerrar» como respuesta.`);
     } catch (error) {
       if (!(error instanceof WhatsAppError) || error.code !== 131047) throw error;
-      if (!template) return false;
       id = await sendWhatsAppTemplate(admin, template, [await clinicName()]);
     }
   }
