@@ -31,7 +31,7 @@ async function dispatch(eventId: string, start: string, actualStart: string, tar
 
   const when = formatAppointment(actualStart);
   const priority = clinicDate(new Date(actualStart)) === clinicDate() ? 'Para hoy' : 'Programada';
-  const sendTemplate = () => sendWhatsAppTemplate(target.phone, target.template!, [clinicName(), when, priority]);
+  const sendTemplate = async () => sendWhatsAppTemplate(target.phone, target.template!, [await clinicName(), when, priority]);
   let id: string;
   try {
     if (target.inWindow) {

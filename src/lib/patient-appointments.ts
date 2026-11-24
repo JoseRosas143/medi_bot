@@ -18,9 +18,9 @@ function appointmentCode(event: CalendarEventData) {
   return createHash('sha256').update(JSON.stringify([event.eventId, Date.parse(event.start)])).digest('hex').slice(0, 32);
 }
 
-function showAppointment(phone: string, event: CalendarEventData) {
+async function showAppointment(phone: string, event: CalendarEventData) {
   const id = appointmentCode(event);
-  const bodyText = `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}\n\n${formatVisitLocation()}`;
+  const bodyText = `🗓️ *Tu cita*\n${formatAppointment(event.start)}\n\n${event.attendanceConfirmed ? 'Asistencia confirmada' : 'Asistencia pendiente de confirmar'}\n\n${await formatVisitLocation()}`;
   const buttons = [
       ...(!event.attendanceConfirmed ? [{ id: `appt_attend_${id}`, title: 'Confirmar asistencia' }] : []),
       { id: `appt_move_${id}`, title: 'Cambiar horario' },

@@ -1,8 +1,9 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicName } from '@/lib/clinic-time';
+import { clinicIdentity } from '@/lib/clinic-configuration';
 import { sendWhatsAppInteractiveButtons, sendWhatsAppInteractiveList, sendWhatsAppText, WhatsAppError, type WhatsAppListSection } from '@/lib/whatsapp';
 
-export const botName = () => process.env.CLINIC_BOT_NAME || 'Benson';
+export const botName = async () => (await clinicIdentity()).bot;
 
 export function normalized(text: string) {
   return text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim().replace(/[.!?]+$/, '');
@@ -28,11 +29,13 @@ export async function showList(to: string, bodyText: string, buttonText: string,
   }
 }
 
-export function showPatientMenu(to: string) {
-  return showList(to, `🦷 *${clinicName()}*\nElige una opción o escríbeme lo que necesitas.`, 'Ver opciones', [
+export async function showPatientMenu(to: string, returningName?: string) {
+  const greeting = returningName ? `\nHola de nuevo, ${returningName.replace(/\s+/g, ' ').slice(0, 100)}.\n` : '';
+  return showList(to, `🦷 *${await clinicName()}*\n${greeting}Elige una opción o escríbeme lo que necesitas.`, 'Ver opciones', [
     { title: 'Tu cita', rows: [
       { id: 'agendar', title: 'Agendar cita', description: 'Consulta horarios y reserva' },
       { id: 'cancelar', title: 'Mis citas', description: 'Consulta o cancela una cita' },
+      { id: 'my_debts', title: 'Mis deudas', description: 'Consulta tu saldo registrado' },
     ] },
     { title: 'La clínica', rows: [
       { id: 'menu_tratamientos', title: 'Tratamientos y precios', description: 'Explora los precios registrados' },
@@ -42,16 +45,16 @@ export function showPatientMenu(to: string) {
   ]);
 }
 
-export function showAdminMenu(to: string) {
-  return showList(to, `🦷 *${clinicName()} · Administración*\nElige una tarea o escribe lo que necesitas hacer.`, 'Abrir panel', [
+export async function showAdminMenu(to: string) {
+  return showList(to, `🦷 *${await clinicName()} · Administración*\nElige una tarea o escribe lo que necesitas hacer.`, 'Abrir panel', [
     { title: 'Agenda y clínica', rows: [
       { id: 'admin_agenda', title: 'Agenda de hoy' },
       { id: 'admin_wait_queue_0', title: 'Lista de espera', description: 'Consulta solicitudes y ofertas' },
       { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
       { id: 'admin_cancelar', title: 'Administrar cita', description: 'Corrige el WhatsApp o cancela' },
-      { id: 'admin_task', title: 'Anotar pendiente' },
-      { id: 'admin_tasks_0', title: 'Ver pendientes', description: 'Consulta tareas y sus recordatorios' },
-      { id: 'admin_cerrar_chat', title: 'Cerrar chat directo' },
+      { id: 'admin_tasks_menu', title: 'Pendientes', description: 'Anota y consulta tareas' },
+      { id: 'admin_crm', title: 'Pacientes · CRM' },
+      { id: 'admin_config', title: 'Configuración', description: 'Edita nombres y horario' },
     ] },
     { title: 'Catálogo', rows: [
       { id: 'adm_add_treatment', title: 'Agregar tratamiento' },

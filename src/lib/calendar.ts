@@ -1,6 +1,7 @@
 import { google, type calendar_v3 } from 'googleapis';
 import { clinicDate, clinicInstant, CLINIC_TIMEZONE, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { comparableWhatsApp, isWhatsAppPhone, phoneDigits } from '@/lib/whatsapp';
+import { weeklyHours, type WeeklyHours } from '@/lib/clinic-configuration';
 
 const APPOINTMENT_MINUTES = 45;
 
@@ -71,9 +72,11 @@ async function getBusySlots(start: string, end: string) {
   return busy;
 }
 
-function workingHours(date: string) {
-  const opening = clinicInstant(date, process.env.CLINIC_OPEN_TIME || '09:00');
-  const closing = clinicInstant(date, process.env.CLINIC_CLOSE_TIME || '19:00');
+function workingHours(date: string, week: WeeklyHours) {
+  const day = week.find(item => item.weekday === new Date(`${date}T00:00:00Z`).getUTCDay());
+  if (!day?.opens_at || !day.closes_at) return null;
+  const opening = clinicInstant(date, day.opens_at.slice(0, 5));
+  const closing = clinicInstant(date, day.closes_at.slice(0, 5));
   if (closing.getTime() <= opening.getTime()) throw new Error('Horario de clínica inválido');
   return { opening, closing };
 }
@@ -90,7 +93,9 @@ function availableSlots(opening: Date, closing: Date, busy: calendar_v3.Schema$T
 }
 
 export async function getAvailableSlots(date: string, duration = APPOINTMENT_MINUTES * 60_000) {
-  const { opening, closing } = workingHours(date);
+  const window = workingHours(date, await weeklyHours());
+  if (!window) return { date, closed: true, slots: [] };
+  const { opening, closing } = window;
   const now = Date.now();
   if (closing.getTime() <= now) return { date, slots: [] };
   const busy = await getBusySlots(opening.toISOString(), closing.toISOString());
@@ -99,10 +104,13 @@ export async function getAvailableSlots(date: string, duration = APPOINTMENT_MIN
 
 export async function getUpcomingSlots(after = Date.now(), duration = APPOINTMENT_MINUTES * 60_000) {
   const earliest = Math.max(after, Date.now());
+  const week = await weeklyHours();
   const days = [];
   for (let date = clinicDate(new Date(earliest)), index = 0; index < 14; index++, date = nextDate(date)) {
-    days.push(workingHours(date));
+    const day = workingHours(date, week);
+    if (day && day.closing.getTime() > earliest) days.push(day);
   }
+  if (!days.length) return [];
   const busy = await getBusySlots(days[0].opening.toISOString(), days[days.length - 1].closing.toISOString());
   return days.flatMap(({ opening, closing }) => availableSlots(opening, closing, busy, earliest, duration));
 }
@@ -194,6 +202,15 @@ export async function getPatientAppointments(patientPhone: string) {
   const now = new Date();
   const events = await listAppointments({ timeMin: now.toISOString(), privateExtendedProperty: [`patientPhone=${patientPhone}`] });
   return events.filter(event => event.patientPhone === patientPhone && Date.parse(event.start) > now.getTime());
+}
+
+export async function getPatientVisitHistory(patientPhone: string, from: string, to: string) {
+  const canonical = comparableWhatsApp(patientPhone);
+  const numbers = /^52\d{10}$/.test(canonical) ? [canonical, `521${canonical.slice(2)}`] : [canonical];
+  const histories = await Promise.all(numbers.map(phone => listAppointments({
+    timeMin: from, timeMax: to, privateExtendedProperty: [`patientPhone=${phone}`],
+  })));
+  return histories.flat().filter(event => numbers.includes(event.patientPhone));
 }
 
 export async function findUpcomingAppointmentsByWhatsApp(phone: string) {
