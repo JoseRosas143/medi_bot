@@ -18,6 +18,14 @@ const panels = { id: 'admin_panel', title: 'Volver al panel' };
 const columns = 'phone,full_name,last_inbound_at';
 const unavailable = (phone: string) => sendWhatsAppText(phone, 'La opción cambió o venció. Abre el panel para iniciar de nuevo.');
 const patientLabel = (patient: Patient) => `${shorten(patient.full_name || 'Paciente', 65)} · •••• ${patient.phone.slice(-4)}`;
+const directoryPageSize = 6;
+const directoryHome = { id: 'admin_crm', title: 'Directorio de pacientes' };
+const patientDirectory = () => db.from('patients').select(columns)
+  .order('last_inbound_at', { ascending: false, nullsFirst: false }).order('updated_at', { ascending: false }).order('phone');
+const patientRows = (patients: Patient[]) => patients.map(patient => ({
+  id: `crm_view_${patient.phone}`, title: patient.full_name?.trim() || 'Paciente sin nombre',
+  description: `WhatsApp •••• ${patient.phone.slice(-4)}`,
+}));
 
 async function accountBalance(phone: string) {
   const { data } = await db.rpc('patient_account_balance', { p_phone: phone }).throwOnError();
@@ -37,21 +45,63 @@ async function findPatient(phone: string): Promise<Patient | null> {
   return data;
 }
 
+async function showPatientDirectory(admin: string, page = 0) {
+  const offset = page * directoryPageSize;
+  const { data } = await patientDirectory().range(offset, offset + directoryPageSize).throwOnError();
+  const patients = (data ?? []) as Patient[];
+  const rows = patientRows(patients.slice(0, directoryPageSize));
+  await showList(admin, `*Directorio de pacientes*\n${rows.length ? 'Los contactos que hablaron más recientemente aparecen primero.'
+    : page ? 'Esta página ya no tiene pacientes. Vuelve a la primera para actualizar.' : 'Aún no hay pacientes registrados.'}`,
+  'Ver pacientes', [
+    ...(rows.length ? [{ title: 'Pacientes', rows }] : []),
+    { title: 'Navegación', rows: [
+      { id: 'crm_search', title: 'Buscar paciente' },
+      ...(page > 0 ? [{ id: `crm_directory_${page - 1}`, title: 'Página anterior' }] : []),
+      ...(patients.length > directoryPageSize ? [{ id: `crm_directory_${page + 1}`, title: 'Página siguiente' }] : []),
+      panels,
+    ] },
+  ], 'Para abrir una ficha por búsqueda, escribe «Buscar paciente» y un nombre, un WhatsApp o sus últimos cuatro dígitos.');
+}
+
+async function searchPatientNames(tokens: string[]) {
+  const longest = tokens.reduce((a, b) => a.length >= b.length ? a : b);
+  // The candidate query preserves accents in storage. Filter its broader matches against the folded name.
+  const pattern = `%${longest.replace(/[aeioun]/g, '_')}%`;
+  const patients: Patient[] = [];
+  const batch = 80;
+  for (let offset = 0; offset < 800; offset += batch) {
+    const { data } = await patientDirectory().ilike('full_name', pattern).range(offset, offset + batch - 1).throwOnError();
+    const matches = ((data ?? []) as Patient[]).filter(patient =>
+      tokens.every(token => normalized(patient.full_name || '').includes(token)));
+    patients.push(...matches.slice(0, 9 - patients.length));
+    if (patients.length >= 9 || (data?.length ?? 0) < batch) return { patients, broad: false };
+  }
+  return { patients, broad: true };
+}
+
 async function searchPatients(admin: string, term: string) {
   const digits = parseClinicWhatsApp(term);
-  const name = term.replace(/[%*_\\]/g, '').trim().slice(0, 100);
-  if (!digits && name.length < 2) return sendWhatsAppText(admin, 'Escribe «Buscar paciente» seguido de un nombre o número de WhatsApp.');
-  const query = db.from('patients').select(columns).order('full_name').order('phone').limit(9);
-  const canonical = digits && comparableWhatsApp(digits);
-  if (canonical) query.in('phone', /^52\d{10}$/.test(canonical) ? [canonical, `521${canonical.slice(2)}`] : [canonical]);
-  else query.ilike('full_name', `%${name}%`);
-  const { data } = await query.throwOnError();
-  const patients = (data ?? []) as Patient[];
-  if (!patients.length) return sendWhatsAppText(admin, 'No encontré pacientes. Prueba con otro nombre o con el WhatsApp completo.');
-  await showList(admin, `*Resultados del CRM*\n${patients.length > 8 ? 'Mostrando 8 coincidencias. Precisa la búsqueda si falta alguien.' : 'Elige un paciente.'}`,
-    'Ver pacientes', [{ title: 'Pacientes', rows: patients.slice(0, 8).map(patient => ({
-      id: `crm_view_${patient.phone}`, title: patient.full_name || 'Paciente', description: `WhatsApp •••• ${patient.phone.slice(-4)}`,
-    })) }]);
+  const suffix = /^\d{4,9}$/.test(term.trim()) ? term.trim() : null;
+  const tokens = normalized(term.slice(0, 100)).match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (!digits && !suffix && !tokens.some(token => token.length >= 2)) {
+    return sendWhatsAppText(admin, 'Escribe «Buscar paciente» seguido de un nombre, WhatsApp o sus últimos cuatro dígitos. Por ejemplo, «Buscar paciente Ana» o «Buscar paciente 5034».');
+  }
+  let patients: Patient[];
+  let broad = false;
+  if (digits || suffix) {
+    const query = patientDirectory().limit(9);
+    if (digits) {
+      const phone = comparableWhatsApp(digits);
+      query.in('phone', /^52\d{10}$/.test(phone) ? [phone, `521${phone.slice(2)}`] : [phone]);
+    } else query.like('phone', `%${suffix}`);
+    const { data } = await query.throwOnError();
+    patients = (data ?? []) as Patient[];
+  } else ({ patients, broad } = await searchPatientNames(tokens));
+  if (!patients.length) return sendWhatsAppText(admin, broad
+    ? 'Hay muchos perfiles para revisar. Añade un apellido o busca por WhatsApp.'
+    : 'No encontré coincidencias. Prueba con un nombre más corto, los últimos cuatro dígitos o abre «Pacientes · CRM».');
+  await showList(admin, `*Resultados del CRM*\n${broad || patients.length > 8 ? 'Puedes precisar la búsqueda si falta alguien.' : 'Elige un paciente.'}`,
+    'Ver pacientes', [{ title: 'Pacientes', rows: patientRows(patients.slice(0, 8)) }, { title: 'Navegación', rows: [directoryHome] }]);
 }
 
 async function showPatientRecord(admin: string, patient: Patient) {
@@ -64,7 +114,7 @@ async function showPatientRecord(admin: string, patient: Patient) {
       { id: `crm_patient_name_${patient.phone}`, title: 'Corregir nombre' },
       { id: `crm_charge_${patient.phone}`, title: 'Agregar deuda' },
       { id: `crm_payment_${patient.phone}`, title: 'Reducir deuda' },
-      { id: 'admin_crm', title: 'Buscar otro paciente' },
+      directoryHome,
     ] }]);
 }
 
@@ -232,6 +282,7 @@ export async function handleClinicAdministration(admin: string, option?: string,
   const text = !context ? normalized(content) : '';
   if (!option && context && await reviewInput(admin, context, content)) return true;
   const search = !option && !context ? content.trim().match(/^buscar paciente(?:\s+(.+))?$/i) : null;
+  const directoryPage = option?.match(/^crm_directory_(\d{1,5})$/);
   const config = option?.match(/^setup_(clinic_name|bot_name|day_([0-6]))$/);
   const crm = option?.match(/^crm_(view|visits|message|charge|payment|patient_name)_([1-9]\d{7,14})$/);
   const blockPage = option?.match(/^setup_blocks_(\d{1,5})$/);
@@ -247,7 +298,10 @@ export async function handleClinicAdministration(admin: string, option?: string,
   else if (option === 'admin_tasks_menu') await showList(admin, '*Pendientes*', 'Ver opciones', [{ title: 'Pendientes', rows: [
     { id: 'admin_task', title: 'Anotar pendiente' }, { id: 'admin_tasks_0', title: 'Ver pendientes' }, panels,
   ] }]);
-  else if (option === 'admin_crm' || (!option && ['pacientes', 'crm'].includes(text))) await searchPatients(admin, '');
+  else if (option === 'admin_crm' || directoryPage || (!option && ['pacientes', 'crm'].includes(text))) {
+    await showPatientDirectory(admin, Number(directoryPage?.[1] || 0));
+  }
+  else if (option === 'crm_search') await searchPatients(admin, '');
   else if (search) await searchPatients(admin, search[1] || '');
   else if (config) await beginInput(admin, config[2] === undefined ? config[1] as Action : 'hours', config[2], config[2] ? weekdays[Number(config[2])] : '');
   else if (decision) await applyInput(admin, decision[2], decision[1] === 'save');
