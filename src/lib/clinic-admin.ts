@@ -6,6 +6,7 @@ import { formatAppointment } from '@/lib/clinic-time';
 import { formatPrice, normalized, showList } from '@/lib/menus';
 import { withCalendarLock } from '@/lib/calendar-lock';
 import { correctedName, savePatientName } from '@/lib/patient-name';
+import { closeHumanChat, openHumanChat, recordChatMessage, trackHumanChatReply, type HumanPatient } from '@/lib/human-chat';
 import { describeBlock, parseScheduleBlock, removeScheduleBlock, reviewScheduleBlock, scheduleBlocks, showScheduleBlocks, type BlockAction } from '@/lib/schedule-blocks';
 import { comparableWhatsApp, hasWhatsAppWindow, parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText, shorten, WhatsAppError } from '@/lib/whatsapp';
 
@@ -20,6 +21,7 @@ const unavailable = (phone: string) => sendWhatsAppText(phone, 'La opción cambi
 const patientLabel = (patient: Patient) => `${shorten(patient.full_name || 'Paciente', 65)} · •••• ${patient.phone.slice(-4)}`;
 const directoryPageSize = 6;
 const directoryHome = { id: 'admin_crm', title: 'Directorio de pacientes' };
+const closedWindow = 'La ventana de WhatsApp está cerrada. Pide al paciente que escriba a Benson y vuelve a intentar.';
 const patientDirectory = () => db.from('patients').select(columns)
   .order('last_inbound_at', { ascending: false, nullsFirst: false }).order('updated_at', { ascending: false }).order('phone');
 const patientRows = (patients: Patient[]) => patients.map(patient => ({
@@ -109,7 +111,7 @@ async function showPatientRecord(admin: string, patient: Patient) {
   const next = upcoming[0];
   await showList(admin, `*Ficha del paciente*\n${patientLabel(patient)}\nSaldo ${formatPrice(cents / 100)}\nPróxima cita ${next ? formatAppointment(next.start) : 'Sin cita futura'}`,
     'Ver acciones', [{ title: 'Paciente', rows: [
-      { id: `crm_message_${patient.phone}`, title: 'Mandar mensaje' },
+      { id: `crm_message_${patient.phone}`, title: 'Enviar mensaje' },
       { id: `crm_visits_${patient.phone}`, title: 'Asistencia y citas' },
       { id: `crm_patient_name_${patient.phone}`, title: 'Corregir nombre' },
       { id: `crm_charge_${patient.phone}`, title: 'Agregar deuda' },
@@ -153,7 +155,7 @@ async function showHours(admin: string) {
 
 const actionNames: Record<Action, string> = {
   clinic_name: 'Nombre de la clínica', bot_name: 'Nombre del bot', hours: 'Horario de atención',
-  message: 'Mandar mensaje', charge: 'Agregar deuda', payment: 'Reducir deuda',
+  message: 'Enviar mensaje', charge: 'Agregar deuda', payment: 'Reducir deuda',
   patient_name: 'Corregir nombre del paciente', block_dates: 'Bloquear fechas', block_hours: 'Bloquear horas',
 };
 
@@ -171,17 +173,38 @@ async function beginInput(admin: string, action: Action, target = '', label = ''
   const instructions = action === 'hours' ? 'Responde a este mensaje con «13:00-17:00» o «Cerrado».'
     : action === 'block_dates' ? 'Responde con una fecha «AAAA-MM-DD» o un rango «AAAA-MM-DD a AAAA-MM-DD». Incluye el último día que tenga que quedar cerrado.'
     : action === 'block_hours' ? 'Responde con la fecha y las horas en formato «AAAA-MM-DD 13:00-15:00».'
-    : action === 'message' ? 'Responde a este mensaje con el texto que quieres enviar.'
+    : action === 'message' ? (target ? 'Responde a este mensaje con el texto que quieres enviar.'
+      : 'Escribe el WhatsApp del paciente. Usa 10 dígitos para México o incluye el código de país.')
     : action === 'charge' || action === 'payment' ? 'Responde a este mensaje con el importe en MXN y un concepto, por ejemplo «500 Abono en recepción».'
     : 'Responde a este mensaje con el nuevo nombre.';
   const prompt = await sendWhatsAppText(admin, `*${actionNames[action]}*${label ? `\n${label}` : ''}\n\n${instructions}`);
   await drafts().upsert({ actor_phone: admin, id: randomUUID(), action, target, prompt_id: prompt, value: null, expires_at: expiry() }).throwOnError();
 }
 
+async function chooseMessageContact(admin: string, input: string) {
+  const digits = parseClinicWhatsApp(input);
+  if (!digits) return sendWhatsAppText(admin, 'Escribe un número de WhatsApp válido. Usa 10 dígitos o incluye el código de país.');
+  const canonical = comparableWhatsApp(digits);
+  const numbers = /^52\d{10}$/.test(canonical) ? [canonical, `521${canonical.slice(2)}`] : [canonical];
+  const { data } = await db.from('patients').select(columns).in('phone', numbers).limit(2).throwOnError();
+  if (data?.length === 2) return sendWhatsAppText(admin, 'Encontré dos fichas con ese número. Abre la ficha correcta desde «Pacientes · CRM».');
+  const patient = data?.[0] as Patient | undefined;
+  if (!patient || !hasWhatsAppWindow(patient.last_inbound_at)) return sendWhatsAppText(admin, closedWindow);
+  return beginInput(admin, 'message', patient.phone, patientLabel(patient));
+}
+
 async function reviewInput(admin: string, context: string, content: string) {
   const { data } = await drafts().select('*').eq('actor_phone', admin).eq('prompt_id', context).maybeSingle().throwOnError();
   if (!data) return false;
   const draft = data as Draft;
+  if (Date.parse(draft.expires_at) <= Date.now()) {
+    await unavailable(admin);
+    return true;
+  }
+  if (draft.action === 'message' && !draft.target) {
+    await chooseMessageContact(admin, content);
+    return true;
+  }
   const value = content.trim();
   const amount = draft.action === 'charge' || draft.action === 'payment' ? amountInput(value) : null;
   const block = isBlock(draft.action) ? parseScheduleBlock(value, draft.action) : null;
@@ -197,7 +220,7 @@ async function reviewInput(admin: string, context: string, content: string) {
   }
   const isPatientAction = draft.action === 'message' || draft.action === 'charge' || draft.action === 'payment' || draft.action === 'patient_name';
   const patient = isPatientAction ? await findPatient(draft.target) : null;
-  if (Date.parse(draft.expires_at) <= Date.now() || (isPatientAction && !patient)) {
+  if (isPatientAction && !patient) {
     await unavailable(admin);
     return true;
   }
@@ -235,6 +258,29 @@ async function applyScheduleBlock(admin: string, id: string) {
   await sendWhatsAppText(admin, '✅ Bloqueo guardado para nuevas reservas y cambios de horario. Las citas que ya existen se conservan.');
 }
 
+async function sendReceptionMessage(admin: string, target: string, value: string) {
+  const { data } = await db.from('patients').select(`${columns},chat_mode,human_session_id`).eq('phone', target).maybeSingle().throwOnError();
+  const patient = data as (Patient & HumanPatient) | null;
+  if (!patient || !hasWhatsAppWindow(patient.last_inbound_at)) return sendWhatsAppText(admin, closedWindow);
+  const opening = patient.chat_mode === 'AI_ACTIVE';
+  const sessionId = opening ? await openHumanChat(target) : patient.human_session_id;
+  if (!sessionId) return sendWhatsAppText(admin, 'La conversación cambió. Abre la ficha y vuelve a intentar.');
+  const session = { phone: target, human_session_id: sessionId };
+  try {
+    await sendWhatsAppText(target, value);
+  } catch (error) {
+    if (opening) await closeHumanChat(session);
+    if (error instanceof WhatsAppError && error.code === 131047) return sendWhatsAppText(admin, closedWindow);
+    throw error;
+  }
+  await recordChatMessage(target, 'doctor', value);
+  const receipt = await sendWhatsAppInteractiveButtons({ to: admin,
+    bodyText: `✅ WhatsApp aceptó el mensaje para ${patientLabel(patient)}.\n\nSus respuestas llegarán a recepción. Desliza este aviso para enviar otro mensaje.`,
+    buttons: [{ id: `chat_close_${target}_${sessionId}`, title: 'Cerrar chat' }],
+  });
+  await trackHumanChatReply(receipt, session);
+}
+
 async function applyInput(admin: string, id: string, save: boolean) {
   if (save) {
     const { data: pending } = await drafts().select('action').eq('actor_phone', admin).eq('id', id).maybeSingle().throwOnError();
@@ -255,15 +301,7 @@ async function applyInput(admin: string, id: string, save: boolean) {
     const name = correctedName(value);
     if (!name || !await savePatientName(target, name)) return unavailable(admin);
   } else if (action === 'message') {
-    const patient = await findPatient(target);
-    if (!patient || !hasWhatsAppWindow(patient.last_inbound_at)) return sendWhatsAppText(admin, 'La ventana de WhatsApp está cerrada. Podrás enviar el mensaje cuando el paciente vuelva a escribir.');
-    try {
-      await sendWhatsAppText(patient.phone, value);
-    } catch (error) {
-      if (error instanceof WhatsAppError && error.code === 131047) return sendWhatsAppText(admin, 'La ventana de WhatsApp venció. El paciente debe volver a escribir.');
-      throw error;
-    }
-    return sendWhatsAppText(admin, '✅ WhatsApp aceptó el mensaje para el paciente.');
+    return sendReceptionMessage(admin, target, value);
   } else {
     const amount = amountInput(value);
     if (!amount) return unavailable(admin);
@@ -281,6 +319,11 @@ async function applyInput(admin: string, id: string, save: boolean) {
 export async function handleClinicAdministration(admin: string, option?: string, content = '', context?: string) {
   const text = !context ? normalized(content) : '';
   if (!option && context && await reviewInput(admin, context, content)) return true;
+  if (!option && !context && parseClinicWhatsApp(content)) {
+    const { data } = await drafts().select('prompt_id').eq('actor_phone', admin).eq('action', 'message')
+      .eq('target', '').gt('expires_at', new Date().toISOString()).maybeSingle().throwOnError();
+    if (data?.prompt_id && await reviewInput(admin, data.prompt_id, content)) return true;
+  }
   const search = !option && !context ? content.trim().match(/^buscar paciente(?:\s+(.+))?$/i) : null;
   const directoryPage = option?.match(/^crm_directory_(\d{1,5})$/);
   const config = option?.match(/^setup_(clinic_name|bot_name|day_([0-6]))$/);
@@ -289,7 +332,8 @@ export async function handleClinicAdministration(admin: string, option?: string,
   const blockAction = option?.match(/^setup_(block_dates|block_hours)$/);
   const blockDecision = option?.match(/^setup_block_(review|remove)_([a-f0-9-]{36})$/);
   const decision = option?.match(/^clinic_(save|back)_([a-f0-9-]{36})$/);
-  if (option === 'admin_config' || (!option && text === 'configuracion')) await showConfiguration(admin);
+  if (option === 'admin_message_number' || (!option && text === 'enviar mensaje a numero')) await beginInput(admin, 'message');
+  else if (option === 'admin_config' || (!option && text === 'configuracion')) await showConfiguration(admin);
   else if (option === 'setup_hours') await showHours(admin);
   else if (blockPage) await showScheduleBlocks(admin, Number(blockPage[1]));
   else if (blockAction) await beginInput(admin, blockAction[1] as BlockAction);
