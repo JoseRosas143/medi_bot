@@ -11,7 +11,7 @@ import { runPatientAgent } from '@/lib/handlers/patientHandler';
 import { handleTreatmentEditor } from '@/lib/treatment-editor';
 import { handleWaitlistOffer } from '@/lib/waitlist';
 import { handleAdminWaitlist } from '@/lib/waitlist-admin';
-import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
+import { botName, catalogDetail, normalized, sendCatalogDetail, showAdminFaqMenu, showAdminMenu, showCatalog, showPatientMenu, treatmentName } from '@/lib/menus';
 import { isWhatsAppPhone, phoneDigits, sendWhatsAppTemplate, sendWhatsAppText, WhatsAppError } from '@/lib/whatsapp';
 
 export type IncomingMessage = {
@@ -240,6 +240,7 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (await handleAppointmentAction(from, optionId, true)) return;
   if (await handleTreatmentEditor(from, optionId, content, contextMessageId)) return;
   if (optionId === 'admin_panel') return showAdminMenu(from);
+  if (optionId === 'adm_faq_menu') return showAdminFaqMenu(from);
   if (await handleAdminWaitlist(from, optionId, contextMessageId ? '' : text)) return;
   const taskPage = optionId?.match(/^admin_tasks_(\d{1,6})$/);
   if (taskPage || (!optionId && /^(?:ver |lista de |mis )?pendientes$/.test(text))) {

@@ -40,6 +40,7 @@ const treatmentDrafts = new Map();
 const waitEntries = new Map();
 const waitOpenings = new Map();
 const waitOffers = new Map();
+let calendarLock = null;
 const bookingNotices = new Map();
 const lastInbounds = new Map();
 let adminLastInbound = null;
@@ -166,6 +167,18 @@ function query(table) {
     then: resolve => {
       if (table === 'bot_settings' && operation === 'select') {
         return resolve({ data: { task_reminder_template: taskReminderTemplate, admin_last_inbound_at: adminLastInbound }, error: null });
+      }
+      if (table === 'calendar_booking_lock') {
+        if (operation === 'insert') {
+          if (calendarLock) return resolve({ data: null, error: { code: '23505' } });
+          calendarLock = { ...values };
+          return resolve({ data: null, error: null });
+        }
+        if (!calendarLock || !Object.entries(filters).every(([key, value]) => calendarLock[key] === value) ||
+            !constraints.every(check => check(calendarLock))) return resolve({ data: null, error: null });
+        if (operation === 'delete') calendarLock = null;
+        if (operation === 'update') calendarLock = { ...calendarLock, ...values };
+        return resolve({ data: calendarLock, error: null });
       }
       if (table === 'appointment_waitlist' || table === 'waitlist_openings') {
         const isEntry = table === 'appointment_waitlist';
@@ -491,6 +504,64 @@ test('waitlist offers a cancelled slot in FIFO order and moves only the patient 
     waitOpenings.clear();
     waitOffers.clear();
     patientNames.clear();
+    events.clear();
+  }
+});
+
+test('admin can withdraw a waitlist request and reoffer its slot without changing either appointment', async () => {
+  const second = '525500000033';
+  const firstEvent = seedWaitlistAppointment('wait-admin-first', patient, '17');
+  const secondEvent = seedWaitlistAppointment('wait-admin-second', second, '18');
+  const cancelled = seedWaitlistAppointment('wait-admin-opening', '525500000044', '16');
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  patientNames.set(patient, 'Ana Demo');
+  patientNames.set(second, 'Luis Demo');
+  try {
+    await joinWaitlist(patient, 'admin-withdraw-first');
+    await joinWaitlist(second, 'admin-withdraw-second');
+    const expected = await liveCalendar.getCalendarAppointment(cancelled.id);
+    events.delete(cancelled.id);
+    await offerReleasedAppointment(expected);
+    const staleAccept = lastButtons()[0];
+
+    await showAdminMenu(admin);
+    assert.ok(lastButtons().includes('admin_wait_queue_0'));
+    assert.ok(lastButtons().includes('adm_faq_menu'));
+    await webhook([answerButton('open-faq-submenu', 'adm_faq_menu', admin)]);
+    assert.ok(lastButtons().includes('adm_add_faq'));
+    assert.ok(lastButtons().includes('adm_edit_faq'));
+    await webhook([answerButton('open-admin-queue-for-withdrawal', 'admin_wait_queue_0', admin)]);
+    const entry = waitEntries.get(firstEvent.id);
+    await webhook([answerButton('admin-review-withdrawal', `admin_wait_review_${entry.id}`, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Ana Demo/);
+    const confirmation = lastButtons()[0];
+    await webhook([answerButton('patient-cannot-withdraw-admin-request', confirmation, second)]);
+    assert.ok(waitEntries.has(firstEvent.id));
+
+    calendarLock = { id: 1, holder: 'pending-calendar-operation', expires_at: new Date(Date.now() + 60_000).toISOString() };
+    await webhook([answerButton('withdraw-while-calendar-busy', confirmation, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Vuelve a intentar/);
+    assert.ok(waitEntries.has(firstEvent.id));
+    calendarLock = null;
+
+    const before = metaRequests.length;
+    await webhook([answerButton('admin-confirms-withdrawal', confirmation, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Solicitud retirada/);
+    const offers = metaRequests.slice(before).filter(message => message.interactive?.body.text.includes('Se liberó un horario'));
+    assert.deepEqual(offers.map(offer => offer.to), [second]);
+    assert.equal([...waitOffers.values()][0].status, 'withdrawn');
+    assert.equal(waitEntries.has(firstEvent.id), false);
+    await webhook([answerButton('removed-patient-cannot-accept', staleAccept, patient)]);
+    await webhook([answerButton('repeat-admin-withdrawal', confirmation, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /ya no está activa/);
+    assert.equal(events.get(firstEvent.id).start.dateTime, firstEvent.start.dateTime);
+    assert.equal(events.get(secondEvent.id).start.dateTime, secondEvent.start.dateTime);
+  } finally {
+    calendarLock = null;
+    patientNames.clear();
+    waitEntries.clear();
+    waitOpenings.clear();
+    waitOffers.clear();
     events.clear();
   }
 });

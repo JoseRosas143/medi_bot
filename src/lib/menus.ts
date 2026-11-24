@@ -46,6 +46,7 @@ export function showAdminMenu(to: string) {
   return showList(to, `🦷 *${clinicName()} · Administración*\nElige una tarea o escribe lo que necesitas hacer.`, 'Abrir panel', [
     { title: 'Agenda y clínica', rows: [
       { id: 'admin_agenda', title: 'Agenda de hoy' },
+      { id: 'admin_wait_queue_0', title: 'Lista de espera', description: 'Consulta solicitudes y ofertas' },
       { id: 'admin_booking', title: 'Crear cita', description: 'Reserva para un paciente' },
       { id: 'admin_cancelar', title: 'Administrar cita', description: 'Corrige el WhatsApp o cancela' },
       { id: 'admin_task', title: 'Anotar pendiente' },
@@ -55,10 +56,17 @@ export function showAdminMenu(to: string) {
     { title: 'Catálogo', rows: [
       { id: 'adm_add_treatment', title: 'Agregar tratamiento' },
       { id: 'adm_edit_treatment', title: 'Editar tratamiento', description: 'Actualiza la descripción, el precio o la visibilidad' },
-      { id: 'adm_add_faq', title: 'Agregar pregunta' },
-      { id: 'adm_edit_faq', title: 'Editar pregunta', description: 'Actualiza la respuesta o retira la pregunta' },
+      { id: 'adm_faq_menu', title: 'Preguntas frecuentes', description: 'Agrega o edita preguntas' },
     ] },
   ]);
+}
+
+export function showAdminFaqMenu(to: string) {
+  return showList(to, '*Preguntas frecuentes*', 'Ver opciones', [{ title: 'Catálogo', rows: [
+    { id: 'adm_add_faq', title: 'Agregar pregunta' },
+    { id: 'adm_edit_faq', title: 'Editar pregunta', description: 'Actualiza la respuesta o retira la pregunta' },
+    { id: 'admin_panel', title: 'Volver al panel' },
+  ] }], 'Escribe «Agregar pregunta» o «Editar pregunta» y especifica el cambio.');
 }
 
 export type Catalog = 'treatments' | 'faqs';
