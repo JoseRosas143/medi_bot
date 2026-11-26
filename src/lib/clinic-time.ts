@@ -10,9 +10,9 @@ export function clinicDate(value: Date = new Date()): string {
   return ['year', 'month', 'day'].map(type => parts.find(part => part.type === type)?.value).join('-');
 }
 
-export function nextDate(date: string): string {
+export function nextDate(date: string, days = 1): string {
   const value = new Date(`${date}T00:00:00Z`);
-  value.setUTCDate(value.getUTCDate() + 1);
+  value.setUTCDate(value.getUTCDate() + days);
   return value.toISOString().slice(0, 10);
 }
 
@@ -38,6 +38,19 @@ export function clinicInstant(date: string, time: string): Date {
 
 export function clinicDayRange(date: string): [string, string] {
   return [clinicInstant(date, '00:00').toISOString(), clinicInstant(nextDate(date), '00:00').toISOString()];
+}
+
+export function parseClinicDateInput(input: string) {
+  const raw = input.trim();
+  const local = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const date = local ? `${local[3]}-${local[2].padStart(2, '0')}-${local[1].padStart(2, '0')}` : raw;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < clinicDate()) return null;
+  try {
+    clinicInstant(date, '12:00');
+    return date;
+  } catch {
+    return null;
+  }
 }
 
 export function reminderWindow(now: Date = new Date()) {

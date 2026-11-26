@@ -1,5 +1,6 @@
 import { supabaseAdmin as db } from '@/lib/supabase';
 import { clinicInstant, formatAppointment } from '@/lib/clinic-time';
+import { showList } from '@/lib/menus';
 import {
   isWhatsAppPhone, phoneDigits, sendWhatsAppInteractiveButtons, sendWhatsAppTemplate, sendWhatsAppText, shorten, WhatsAppError,
 } from '@/lib/whatsapp';
@@ -48,28 +49,39 @@ function taskReminder(task: ClinicTask, sendingEnabled: boolean) {
   return `${label} · ${formatAppointment(task.reminder_at)}`;
 }
 
-export async function showPendingTasks(phone: string, page = 0) {
+export async function showPendingTasks(phone: string, page = 0, removing = false) {
   const offset = page * pageSize;
   const { data } = await tasks().select(taskColumns).eq('is_completed', false)
     .order('id', { ascending: false }).range(offset, offset + pageSize).throwOnError();
   const rows = (data ?? []) as ClinicTask[];
   if (!rows.length && page === 0) {
-    await sendWhatsAppText(phone, '📋 No hay pendientes abiertos. En «Ayuda» puedes anotar uno.');
+    await sendWhatsAppInteractiveButtons({ to: phone, bodyText: '📋 No hay pendientes abiertos.', buttons: [
+      { id: 'admin_task', title: 'Anotar pendiente' }, { id: 'admin_panel', title: 'Volver al panel' },
+    ] });
     return;
   }
   const sendingEnabled = Boolean(rows.some(task => task.reminder_state === 'scheduled') && await pendingReminderSettings());
-  const lines = rows.slice(0, pageSize).map(task =>
-    `*#${task.id}* ${shorten(task.description.replace(/\s+/g, ' '), 76)}\n${taskReminder(task, sendingEnabled)}`,
-  );
-  await sendWhatsAppInteractiveButtons({
-    to: phone,
-    bodyText: `📋 *Pendientes abiertos*\n\n${lines.join('\n\n') || 'Esta página ya no tiene pendientes.'}\n\nEscribe «Pendiente #» seguido de su número para ver el detalle.`,
-    buttons: [
-      ...(page > 0 ? [{ id: `admin_tasks_${page - 1}`, title: 'Anterior' }] : []),
-      ...(rows.length > pageSize ? [{ id: `admin_tasks_${page + 1}`, title: 'Siguiente' }] : []),
-      { id: 'admin_panel', title: 'Volver al panel' },
-    ],
-  });
+  const selectable = rows.slice(0, pageSize).map(task => ({
+    id: `admin_task_${removing ? 'review_remove' : 'view'}_${task.id}`,
+    title: `#${task.id} ${task.description.replace(/\s+/g, ' ')}`,
+    description: taskReminder(task, sendingEnabled),
+  }));
+  const prefix = removing ? 'admin_tasks_remove_' : 'admin_tasks_';
+  const title = removing ? '¿Qué pendiente quieres borrar?' : 'Pendientes abiertos';
+  await showList(phone, `📋 *${title}*\n${selectable.length
+    ? removing ? 'Elige uno para revisar y confirmar.' : 'Selecciona un pendiente para ver su detalle.'
+    : 'Esta página ya no tiene pendientes.'}`, 'Ver pendientes', [
+    ...(selectable.length ? [{ title: 'Pendientes', rows: selectable }] : []),
+    { title: 'Navegación', rows: [
+      ...(page > 0 ? [{ id: prefix + (page - 1), title: 'Anterior' }] : []),
+      ...(rows.length > pageSize ? [{ id: prefix + (page + 1), title: 'Siguiente' }] : []),
+      ...(removing ? [{ id: 'admin_tasks_0', title: 'Volver a pendientes' }] : [
+        { id: 'admin_task', title: 'Anotar pendiente' },
+        { id: 'admin_tasks_remove_0', title: 'Borrar pendientes' },
+        { id: 'admin_panel', title: 'Volver al panel' },
+      ]),
+    ] },
+  ], 'Escribe «Pendiente #» seguido de su número para abrir el detalle.');
 }
 
 export async function showClinicTask(phone: string, id: number) {
@@ -78,7 +90,15 @@ export async function showClinicTask(phone: string, id: number) {
   if (!data) return sendWhatsAppText(phone, 'No encontré ese pendiente abierto. Escribe «Pendientes» para ver la lista.');
   const task = data as ClinicTask;
   const sendingEnabled = Boolean(task.reminder_state === 'scheduled' && await pendingReminderSettings());
-  return sendWhatsAppText(phone, `📋 *Pendiente #${id}*\n${task.description}\n\n${taskReminder(task, sendingEnabled)}\n\nPara agendar un aviso, escribe «Recuérdame el pendiente #${id} mañana a las 9:00».`);
+  const title = `📋 *Pendiente #${id}*`;
+  const detail = `${title}\n${task.description}\n\n${taskReminder(task, sendingEnabled)}\n\nPara agendar un aviso, escribe «Recuérdame el pendiente #${id} mañana a las 9:00».`;
+  if (detail.length > 1024) await sendWhatsAppText(phone, detail);
+  return sendWhatsAppInteractiveButtons({ to: phone, bodyText: detail.length <= 1024 ? detail : title,
+    buttons: [
+      { id: `admin_task_review_remove_${id}`, title: 'Borrar pendiente' },
+      { id: 'admin_tasks_0', title: 'Volver a pendientes' },
+    ],
+  });
 }
 
 function scheduleFields(at: string) {
@@ -95,13 +115,19 @@ async function savedTaskMessage(task: ClinicTask) {
 
 const invalidSchedule = 'Envía el pendiente y una fecha y hora futuras en el mismo mensaje. Usa la hora local de la clínica.';
 
-export async function addClinicTask(args: { description?: unknown; reminder_requested?: unknown; date?: unknown; time?: unknown }) {
+export async function addClinicTask(args: { description?: unknown; reminder_requested?: unknown; date?: unknown; time?: unknown }, creationToken?: string) {
   const description = typeof args.description === 'string' ? args.description.trim() : '';
   if (!description || description.length > 1500) return 'Indica el pendiente en un mensaje de hasta 1,500 caracteres.';
   const at = scheduledAt(args.date, args.time);
   if ((args.reminder_requested === true || args.date || args.time) && !at) return invalidSchedule;
-  const { data } = await tasks().insert({ description, ...(at ? scheduleFields(at) : {}) })
-    .select(taskColumns).single().throwOnError();
+  const { data, error } = await tasks().insert({
+    description, ...(at ? scheduleFields(at) : {}), ...(creationToken ? { creation_token: creationToken } : {}),
+  }).select(taskColumns).single();
+  if (error?.code === '23505' && creationToken) {
+    const { data: existing } = await tasks().select(taskColumns).eq('creation_token', creationToken).single().throwOnError();
+    return savedTaskMessage(existing as ClinicTask);
+  }
+  if (error) throw error;
   return savedTaskMessage(data as ClinicTask);
 }
 
@@ -115,12 +141,34 @@ export async function scheduleClinicTask(id: unknown, date: unknown, time: unkno
     : 'El pendiente no está abierto o su aviso está en proceso de envío. Revisa «Pendientes».';
 }
 
-export async function completeClinicTask(id: unknown) {
+export async function completeClinicTask(id: unknown, removed = false) {
   if (!validTaskId(id)) return 'Indica el número. Escribe «Pendientes» para encontrarlo.';
   const { data } = await tasks().update({ is_completed: true }).eq('id', id).eq('is_completed', false)
     .or('reminder_state.is.null,reminder_state.neq.sending').select('id').maybeSingle().throwOnError();
-  return data ? `✅ Pendiente #${id} completado.`
+  return data ? `✅ Pendiente #${id} ${removed ? 'retirado de la lista' : 'completado'}.`
     : 'El pendiente ya no está abierto o su aviso está en proceso de envío. Revisa «Pendientes».';
+}
+
+export async function handleTaskButtons(phone: string, option?: string) {
+  const match = option?.match(/^admin_task_(view|review_remove|remove)_(\d{1,10})$/);
+  if (!match || !validTaskId(Number(match[2]))) return false;
+  const [, action, token] = match;
+  const id = Number(token);
+  const back = { id: 'admin_tasks_0', title: 'Volver a pendientes' };
+  if (action === 'view') await showClinicTask(phone, id);
+  else if (action === 'remove') {
+    await sendWhatsAppInteractiveButtons({ to: phone, bodyText: await completeClinicTask(id, true), buttons: [
+      { id: 'admin_tasks_remove_0', title: 'Borrar otro' }, back,
+    ] });
+  } else {
+    const { data } = await tasks().select('description').eq('id', id).eq('is_completed', false).maybeSingle().throwOnError();
+    if (!data) await sendWhatsAppInteractiveButtons({ to: phone, bodyText: 'Ese pendiente ya no está abierto.', buttons: [back] });
+    else await sendWhatsAppInteractiveButtons({ to: phone,
+      bodyText: `*¿Borrar pendiente #${id}?*\n${shorten(data.description, 500)}\n\nSe retirará de la lista y se cancelará su recordatorio si aún está programado.`,
+      buttons: [{ id: `admin_task_remove_${id}`, title: 'Sí, borrar' }, back],
+    });
+  }
+  return true;
 }
 
 export async function runClinicTaskReminders(now = new Date()) {

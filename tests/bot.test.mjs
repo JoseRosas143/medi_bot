@@ -6,7 +6,7 @@ import { test } from 'node:test';
 const databaseUrl = 'data:text/javascript,export const supabaseAdmin={from:(...args)=>globalThis.testDatabase.from(...args),rpc:(...args)=>globalThis.testDatabase.rpc(...args)}';
 const googleUrl = 'data:text/javascript,export const google=globalThis.testGoogle';
 const calendarUrl = 'data:text/javascript,' + encodeURIComponent(`
-  export const { getUpcomingSlots, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
+  export const { getUpcomingSlots, upcomingSlotDays, getAvailableSlots, createCalendarAppointment, findCalendarBooking,
     cancelCalendarEvent, getPatientAppointments, findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, appointmentPatientName,
     getCalendarAppointment, moveCalendarAppointment, confirmCalendarAttendance, appointmentMatchesSlot,
     saveCalendarAppointmentContact, recordCalendarVisit, getPatientVisitHistory } = globalThis.testCalendar;
@@ -115,11 +115,17 @@ const calendarSlots = ['16:00', '17:00', '18:00'].map(hour => ({
   label: `Viernes a las ${hour}`,
 }));
 let proposedDate = null;
+let useLiveAvailability = false;
 globalThis.testCalendar = {
-  getUpcomingSlots: async (_after, duration) => duration ? calendarSlots.map(slot => ({
+  upcomingSlotDays: liveCalendar.upcomingSlotDays,
+  getUpcomingSlots: async (after, duration, fromDate) => fromDate ? liveCalendar.getUpcomingSlots(after, duration, fromDate)
+    : duration ? calendarSlots.map(slot => ({
     ...slot, end: new Date(Date.parse(slot.start) + duration).toISOString(),
   })) : calendarSlots,
-  getAvailableSlots: async date => { proposedDate = date; return { date, slots: calendarSlots }; },
+  getAvailableSlots: async (date, duration) => {
+    proposedDate = date;
+    return useLiveAvailability ? liveCalendar.getAvailableSlots(date, duration) : { date, slots: calendarSlots };
+  },
   createCalendarAppointment: async params => {
     createdAppointments.push(params);
     return calendarSlots.find(slot => slot.start === params.startTime);
@@ -160,6 +166,7 @@ function query(table) {
     single: () => { singleRow = true; return chain; },
     or: rule => {
       if (rule === 'reminder_state.is.null,reminder_state.neq.sending') constraints.push(row => row.reminder_state !== 'sending');
+      if (rule === 'value.is.null,value.neq.saving') constraints.push(row => row.value !== 'saving');
       return chain;
     },
     eq: (field, value) => { filters[field] = value; return chain; },
@@ -286,6 +293,9 @@ function query(table) {
       }
       if (table === 'clinic_tasks') {
         if (operation === 'insert') {
+          if (values.creation_token && [...clinicTasks.values()].some(task => task.creation_token === values.creation_token)) {
+            return resolve({ data: null, error: { code: '23505' } });
+          }
           const id = clinicTasks.size + 1;
           const row = { id, is_completed: false, reminder_at: null, reminder_state: null, ...values };
           clinicTasks.set(id, row);
@@ -461,7 +471,7 @@ globalThis.fetch = async (url, options) => {
 
 const { POST: whatsapp } = await import('../src/app/api/webhook/whatsapp/route.ts');
 const { GET: reminders } = await import('../src/app/api/cron/reminders/route.ts');
-const { clinicDate, clinicDayRange, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
+const { clinicDate, clinicDayRange, clinicInstant, nextDate, reminderWindow } = await import('../src/lib/clinic-time.ts');
 const { showCatalog, showAdminMenu } = await import('../src/lib/menus.ts');
 const { sendAppointmentNotice } = await import('../src/lib/appointment-notices.ts');
 const { dispatchAdminBookingNotice, queueAdminBookingNotice } = await import('../src/lib/admin-booking-notices.ts');
@@ -954,6 +964,14 @@ test('admin can withdraw a waitlist request and reoffer its slot without changin
 test('reception is notified once and can pick a date and offer an earlier slot to the waiting patient', async () => {
   const admin = process.env.ADMIN_PHONE_NUMBER;
   const event = seedWaitlistAppointment('wait-manual-entry', patient, '18');
+  const blockedDay = nextDate(clinicDate());
+  const preferredDay = nextDate(blockedDay);
+  const originalDay = nextDate(preferredDay, 2);
+  event.start.dateTime = clinicInstant(originalDay, '18:00').toISOString();
+  event.end.dateTime = clinicInstant(originalDay, '18:45').toISOString();
+  const [start, end] = clinicDayRange(blockedDay);
+  busyPeriods = [{ start, end }];
+  useLiveAvailability = true;
   adminLastInbound = new Date().toISOString();
   try {
     const before = metaRequests.length;
@@ -963,8 +981,17 @@ test('reception is notified once and can pick a date and offer an earlier slot t
     assert.match(notice.interactive.body.text, /Nueva solicitud de lista de espera/);
     assert.equal(notice.interactive.action.buttons[0].reply.id, `admin_wait_review_${request.id}`);
     await webhook([answerButton('wait-manual-review', `admin_wait_review_${request.id}`, admin)]);
+    busyPeriods = [{ start: clinicDayRange(clinicDate())[0], end: event.start.dateTime }];
+    await webhook([answerButton('wait-manual-empty-days', `admin_wait_day_${request.id}`, admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /No encontré espacios/);
+    assert.ok(!lastButtons().some(id => id.startsWith('admin_wait_slots_')));
+    busyPeriods = [{ start, end }];
     await webhook([answerButton('wait-manual-day', `admin_wait_day_${request.id}`, admin)]);
-    await webhook([textMessage('wait-manual-date', '20/11/2099', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Días disponibles/);
+    assert.ok(!lastButtons().includes(`admin_wait_slots_${request.id}_${blockedDay}_0`));
+    assert.ok(lastButtons().includes(`admin_wait_slots_${request.id}_${preferredDay}_0`));
+    assert.ok(!lastButtons().includes(`admin_wait_slots_${request.id}_${nextDate(originalDay)}_0`));
+    await webhook([answerButton('wait-manual-date', `admin_wait_slots_${request.id}_${preferredDay}_0`, admin)]);
     const slot = lastButtons().find(id => id.startsWith('admin_wait_slot_'));
     assert.ok(slot);
     await webhook([answerButton('wait-manual-slot', slot, admin)]);
@@ -973,10 +1000,12 @@ test('reception is notified once and can pick a date and offer an earlier slot t
     const offer = metaRequests.findLast(message => message.to === patient && message.interactive?.body.text.includes('Se liberó un horario'));
     assert.equal(events.get(event.id).start.dateTime, event.start.dateTime);
     await webhook([answerButton('wait-manual-accept', offer.interactive.action.buttons[0].reply.id, patient)]);
-    assert.equal(Date.parse(events.get(event.id).start.dateTime), Date.parse(calendarSlots[0].start));
+    assert.equal(Date.parse(events.get(event.id).start.dateTime), Number(slot.split('_').at(-1)));
     assert.equal(metaRequests.slice(before).filter(message => message.to === admin && message.interactive?.body.text.includes('Nueva solicitud')).length, 1);
   } finally {
     adminLastInbound = null;
+    useLiveAvailability = false;
+    busyPeriods = [];
     clinicDrafts.clear();
     waitEntries.clear();
     waitOpenings.clear();
@@ -1638,13 +1667,73 @@ test('the admin can list open tasks and set a future reminder on an existing tas
   assert.match(await scheduleClinicTask(1, '2000-01-01', '09:00'), /fecha y hora futuras/);
   const admin = process.env.ADMIN_PHONE_NUMBER;
   await webhook([answerButton('pending-dashboard', 'admin_tasks_0', admin)]);
-  assert.match(metaRequests.at(-1).interactive.body.text, /Pedir guantes[\s\S]*envío pendiente de activación/);
-  await webhook([textMessage('pending-detail', 'Pendiente #1', admin)]);
-  assert.match(metaRequests.at(-1).text.body, /Recuérdame el pendiente #1/);
-  await webhook([textMessage('pending-complete', 'Completar #1', admin)]);
+  const row = metaRequests.at(-1).interactive.action.sections[0].rows[0];
+  assert.equal(row.id, 'admin_task_view_1');
+  assert.match(row.title, /Pedir guantes/);
+  assert.match(row.description, /envío pendiente de activación/);
+  await webhook([answerButton('pending-detail', row.id, admin)]);
+  assert.match(metaRequests.at(-1).interactive.body.text, /Recuérdame el pendiente #1/);
+  await webhook([answerButton('pending-remove-list', 'admin_tasks_remove_0', admin)]);
+  assert.match(metaRequests.at(-1).interactive.body.text, /Qué pendiente quieres borrar/);
+  assert.deepEqual(lastButtons(), ['admin_task_review_remove_1', 'admin_tasks_0']);
+  await webhook([answerButton('pending-remove-review', 'admin_task_review_remove_1', admin)]);
+  const listConfirmation = lastButtons()[0];
+  await webhook([textMessage('pending-remove-by-text', 'Eliminar pendiente #1', admin)]);
+  assert.equal(lastButtons()[0], listConfirmation);
+  assert.match(metaRequests.at(-1).interactive.body.text, /cancelará su recordatorio/);
+  assert.equal(clinicTasks.get(1).is_completed, false);
+  const confirm = lastButtons()[0];
+  await webhook([answerButton('pending-remove-patient', confirm, patient)]);
+  assert.equal(clinicTasks.get(1).is_completed, false);
+  await webhook([answerButton('pending-remove-confirm', confirm, admin)]);
   assert.equal(clinicTasks.get(1).is_completed, true);
+  assert.match(metaRequests.at(-1).interactive.body.text, /retirado de la lista/);
   await webhook([textMessage('pending-empty', 'Pendientes', admin)]);
-  assert.match(metaRequests.at(-1).text.body, /No hay pendientes abiertos/);
+  assert.match(metaRequests.at(-1).interactive.body.text, /No hay pendientes abiertos/);
+});
+
+test('a guided pending task offers 30 dates and 24 hours and saves exactly the confirmed selection once', async () => {
+  const admin = process.env.ADMIN_PHONE_NUMBER;
+  clinicTasks.clear();
+  clinicDrafts.clear();
+  try {
+    await webhook([answerButton('task-guide-menu', 'admin_tasks_menu', admin)]);
+    assert.ok(lastButtons().includes('admin_task'));
+    await webhook([answerButton('task-guide-open', 'admin_task', admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Qué pendiente quieres anotar/);
+    await webhook([{ ...textMessage('task-guide-description', 'Llamar a la clínica', admin), context: { id: `mock_${metaRequests.length}` } }]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Quieres programar un recordatorio/);
+    await webhook([answerButton('task-guide-with-reminder', lastButtons().find(id => id.endsWith('_with')), admin)]);
+    const dates = [];
+    for (let page = 0; page < 5; page++) {
+      dates.push(...lastButtons().filter(id => id.includes('_on_')));
+      if (page < 4) await webhook([answerButton(`task-guide-date-page-${page}`, lastButtons().find(id => id.endsWith(`_dates_${page + 1}`)), admin)]);
+    }
+    assert.equal(new Set(dates).size, 30);
+    const date = nextDate(clinicDate(), 29);
+    assert.ok(dates.at(-1).endsWith(date));
+    await webhook([answerButton('task-guide-date', dates.at(-1), admin)]);
+    const times = [];
+    for (let page = 0; page < 4; page++) {
+      times.push(...lastButtons().filter(id => id.includes('_at_')));
+      if (page < 3) await webhook([answerButton(`task-guide-time-page-${page}`, lastButtons().find(id => id.endsWith(`_times_${page + 1}`)), admin)]);
+    }
+    assert.equal(new Set(times).size, 24);
+    assert.ok(times[0].endsWith('_at_00:00'));
+    assert.ok(times.at(-1).endsWith('_at_23:00'));
+    await webhook([answerButton('task-guide-time', times.find(id => id.endsWith('_at_09:00')), admin)]);
+    assert.match(metaRequests.at(-1).interactive.body.text, /Llamar a la clínica[\s\S]*Recordatorio para/);
+    assert.equal(clinicTasks.size, 0);
+    const confirm = lastButtons()[0];
+    await webhook([answerButton('task-guide-save', confirm, admin)]);
+    await webhook([answerButton('task-guide-save-again', confirm, admin)]);
+    assert.equal(clinicTasks.size, 1);
+    assert.equal(clinicTasks.get(1).reminder_at, clinicInstant(date, '09:00').toISOString());
+    assert.equal(clinicTasks.get(1).description, 'Llamar a la clínica');
+  } finally {
+    clinicTasks.clear();
+    clinicDrafts.clear();
+  }
 });
 
 test('concurrent cron runs send each due task just once and only to the administrator', async () => {

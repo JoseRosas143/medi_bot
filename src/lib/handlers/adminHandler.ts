@@ -4,7 +4,8 @@ import { supabaseAdmin as db } from '@/lib/supabase';
 import { findUpcomingAppointmentsByWhatsApp, getAppointmentsByDateRange, type CalendarEventData } from '@/lib/calendar';
 import { clinicDate, clinicDayRange, formatAppointment, nextDate } from '@/lib/clinic-time';
 import { proposeAppointmentAction } from '@/lib/appointment-actions';
-import { addClinicTask, completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
+import { completeClinicTask, scheduleClinicTask, showPendingTasks } from '@/lib/clinic-tasks';
+import { startTaskDraft } from '@/lib/task-draft';
 import { botName, findCatalogEntries, normalized, showAdminMenu, showList, type Catalog } from '@/lib/menus';
 import { visitStatusLabel } from '@/lib/reception';
 import { parseClinicWhatsApp, sendWhatsAppInteractiveButtons, sendWhatsAppText } from '@/lib/whatsapp';
@@ -72,11 +73,10 @@ const tools: ChatCompletionTool[] = [
     }, required: ['catalog', 'action'] },
   } },
   { type: 'function', function: {
-    name: 'add_task', description: 'Anota un pendiente interno nuevo, con recordatorio si fue pedido. La fecha y la hora son de la clínica.',
+    name: 'add_task', description: 'Abre el formulario para anotar un pendiente interno. Proporciona solo la descripción de la tarea.',
     parameters: { type: 'object', properties: {
-      description: { type: 'string' }, reminder_requested: { type: 'boolean' },
-      date: { type: 'string', description: 'YYYY-MM-DD' }, time: { type: 'string', description: 'HH:MM, 24 horas' },
-    }, required: ['description', 'reminder_requested'] },
+      description: { type: 'string' },
+    }, required: ['description'] },
   } },
   { type: 'function', function: {
     name: 'schedule_task_reminder', description: 'Programa o cambia el recordatorio de un pendiente abierto cuando el administrador proporciona su número, fecha y hora.',
@@ -170,7 +170,7 @@ Usa las herramientas para consultar agenda, corregir el WhatsApp de una cita, pr
       }
       if (name === 'manage_catalog') result = await manageCatalog(args);
       if (name === 'list_tasks') return showPendingTasks(from);
-      if (name === 'add_task') return void await sendWhatsAppText(from, await addClinicTask(args));
+      if (name === 'add_task') return startTaskDraft(from, typeof args.description === 'string' ? args.description : undefined);
       if (name === 'schedule_task_reminder') return void await sendWhatsAppText(from, await scheduleClinicTask(args.id, args.date, args.time));
       if (name === 'complete_task') return void await sendWhatsAppText(from, await completeClinicTask(args.id));
       messages.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify(result) });

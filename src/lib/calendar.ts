@@ -103,11 +103,13 @@ export async function getAvailableSlots(date: string, duration = DEFAULT_APPOINT
   return { date, slots: availableSlots(opening, closing, busy, now, duration) };
 }
 
-export async function getUpcomingSlots(after = Date.now(), duration = DEFAULT_APPOINTMENT_MINUTES * 60_000) {
+export const upcomingSlotDays = 14;
+
+export async function getUpcomingSlots(after = Date.now(), duration = DEFAULT_APPOINTMENT_MINUTES * 60_000, fromDate?: string) {
   const earliest = Math.max(after, Date.now());
   const week = await weeklyHours();
   const days = [];
-  for (let date = clinicDate(new Date(earliest)), index = 0; index < 14; index++, date = nextDate(date)) {
+  for (let date = fromDate ?? clinicDate(new Date(earliest)), index = 0; index < upcomingSlotDays; index++, date = nextDate(date)) {
     const day = workingHours(date, week);
     if (day && day.closing.getTime() > earliest) days.push(day);
   }
