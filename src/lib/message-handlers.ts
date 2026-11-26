@@ -240,6 +240,15 @@ export async function handleAdminMessage(message: IncomingMessage) {
   if (optionId === 'adm_treatment_menu') return showAdminTreatmentMenu(from);
   if (optionId === 'adm_faq_menu') return showAdminFaqMenu(from);
   if (await handleAdminWaitlist(from, optionId, contextMessageId ? '' : text)) return;
+  const removeTask = !optionId && !contextMessageId
+    ? text.match(/^(?:borrar|borra|eliminar|elimina|quitar|quita|retirar|retira)\s+(?:el\s+)?pendiente\s*#?\s*(\d{1,10})$/)
+    : null;
+  if (removeTask) {
+    if (!await handleTaskButtons(from, `admin_task_review_remove_${removeTask[1]}`)) {
+      await sendWhatsAppText(from, 'Abre «Borrar pendientes» para elegir un pendiente válido.');
+    }
+    return;
+  }
   if (await handleTaskDraft(from, optionId, content, contextMessageId)) return;
   if (await handleClinicAdministration(from, optionId, content, contextMessageId)) return;
   if (await handleTaskButtons(from, optionId)) return;

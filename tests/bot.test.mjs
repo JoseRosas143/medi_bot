@@ -1677,6 +1677,9 @@ test('the admin can list open tasks and set a future reminder on an existing tas
   assert.match(metaRequests.at(-1).interactive.body.text, /Qué pendiente quieres borrar/);
   assert.deepEqual(lastButtons(), ['admin_task_review_remove_1', 'admin_tasks_0']);
   await webhook([answerButton('pending-remove-review', 'admin_task_review_remove_1', admin)]);
+  const listConfirmation = lastButtons()[0];
+  await webhook([textMessage('pending-remove-by-text', 'Eliminar pendiente #1', admin)]);
+  assert.equal(lastButtons()[0], listConfirmation);
   assert.match(metaRequests.at(-1).interactive.body.text, /cancelará su recordatorio/);
   assert.equal(clinicTasks.get(1).is_completed, false);
   const confirm = lastButtons()[0];
